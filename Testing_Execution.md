@@ -33,3 +33,25 @@
 **Result**: PASS (manual review). Awaiting backtester PnL check.
 
 **Failures**: None.
+
+## Run 3 — Competitive Market Making Phase 2.5 (2026-04-09)
+
+**Method**: Manual code review
+
+**Checks**:
+- [x] When spread > 1: buy at best_bid + 1, sell at best_ask - 1
+- [x] When spread <= 1: fallback to best_bid / best_ask
+- [x] Crossing guard: if my_bid >= my_ask, revert to original prices
+- [x] Empty book handled: best_bid/best_ask = None, order skipped
+- [x] Position limit check unchanged and correct
+- [x] Log line includes both market prices (bid/ask) and chosen prices (my_bid/my_ask)
+- [x] Return type unchanged: `(dict, int, str)`
+- [ ] Backtester run (not yet installed)
+
+**Result**: PASS (manual review). Awaiting backtester PnL check.
+
+**Expected observation after upload**:
+- Trades should actually execute (fills occur)
+- PnL curve shifts from flat to dynamic
+
+**Failures**: None.
