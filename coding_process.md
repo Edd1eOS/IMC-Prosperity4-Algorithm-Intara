@@ -21,3 +21,27 @@
 - Awaiting backtester verification
 
 **Effective**: Yes — skeleton matches platform contract exactly
+
+## Entry 2 — Basic Market Making
+
+**Date**: 2026-04-09
+
+**What changed**:
+- Replaced market-taking logic with market-making logic in `tut_round_trader.py`
+- Phase 1 bought at best_ask and sold at best_bid (crossed spread, paid spread every tick)
+- Phase 2 posts buy at best_bid and sell at best_ask (provides liquidity, earns spread when filled)
+- Added structured `print()` log line per product per tick: symbol, bid, ask, spread, position, order count
+- Extracted `best_bid` / `best_ask` into named variables for clarity
+
+**Why**:
+- Market taking guarantees loss equal to spread per tick
+- Market making inverts this: if both sides fill, we earn the spread
+- Logging needed for observability without external tooling
+
+**Result**:
+- Code compiles (only expected `datamodel` import warning)
+- Orders now post on same side as book (bid side buy, ask side sell)
+- Log output captured by backtester stdout
+- Awaiting backtester run for PnL verification
+
+**Effective**: Pending backtester verification

@@ -18,6 +18,7 @@ prosperity4btx tut_round_trader.py 0
 1. **Return type**: `run()` returns `(dict[Symbol, list[Order]], int, str)`
 2. **No crash on empty book**: if a product has no bids or asks, no KeyError
 3. **Import correctness**: only `from datamodel import ...` (platform-provided)
+4. **Log output**: each tick prints one line per product with bid/ask/spread/pos/orders
 
 ## Current Phase: Skeleton
 
