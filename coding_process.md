@@ -76,3 +76,33 @@
 - Awaiting backtester run for PnL verification
 
 **Effective**: Pending backtester verification
+
+## Entry 4 — Multi-asset Config & Hard Limits
+
+**Date**: 2026-04-13
+
+**What changed**:
+- Replaced `POSITION_LIMITS` dict + `ALPHA` scalar with unified `TRADING_CONFIG` composite dictionary
+- Each asset now has independent `limit`, `alpha`, `base_spread` parameters
+- Added `clamp_order_volume()` function: hard-clamps order volume before Order creation
+  - Buy: `actual = min(desired, limit - position)`, drop if <= 0
+  - Sell: `actual = max(desired, -limit - position)`, drop if >= 0
+  - Deterministic log output on every clamp/drop event
+- Layer 2 orders now account for pending Layer 1 volume when computing remaining capacity
+- Config lookup: `TRADING_CONFIG.get(symbol)` with explicit skip + log if asset has no config entry
+- Pre-reserved config slots for R1 assets: AMETHYSTS (limit=20), STARFISH (limit=20)
+
+**Why**:
+- Round 1 introduces multiple assets with different position limits and volatility profiles
+- Single `ALPHA` and flat `POSITION_LIMITS` dict cannot express per-asset parameters
+- Old position check (`position + N <= limit`) was correct but implicit and fragile — no log, no clamp, relied on hardcoded layer counts
+- Platform rejects orders exceeding position limits silently; hard clamp prevents wasted order slots
+
+**Hypothesis**:
+- No behavioral change for EMERALDS/TOMATOES in tutorial round (same limit=80, alpha=0.1)
+- Framework ready for R1 multi-asset deployment with zero structural changes
+- CLAMP logs will fire when position approaches limit, providing observability for debugging
+
+**Result**:
+- Code compiles (only expected `datamodel` import warning)
+- Awaiting backtester verification
