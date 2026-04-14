@@ -4,6 +4,12 @@ backtester.py - IMC Prosperity 4 Local Backtester v1
 Naive matching engine with mark-to-market PnL tracking.
 Usage: python backtester.py <path_to_csv>
 """
+# ================================================================
+# CHANGELOG v5.4
+# - FILL_PROB_IMPROVEMENT: 0.3 → 0.03  (compress local PnL to ~3k-5k)
+# - FILL_PROB_QUEUE:       0.1 → 0.02
+# - MTM forward-fill: last_valid_mid prevents pos*0 spike when mid_price missing
+# ================================================================
 
 import sys
 import os
@@ -75,7 +81,7 @@ for _n, _o in [("Order", Order), ("OrderDepth", OrderDepth),
 sys.modules["datamodel"] = _dm
 
 # -- 桩注入完成，安全导入 Trader --
-from tut_round_trader import Trader, TRADING_CONFIG
+from round1_trader import Trader, TRADING_CONFIG
 
 import pandas as pd
 import matplotlib
@@ -187,8 +193,8 @@ def build_state_for_tick(tick_df: pd.DataFrame, positions: dict,
 # ================================================================
 
 # Fill probability parameters (tunable)
-FILL_PROB_IMPROVEMENT = 0.3   # 价格占优 (spread 内部): 30% 概率被散户市价单命中
-FILL_PROB_QUEUE       = 0.1   # 同价排队 (best_bid/ask): 10% 概率排到队首
+FILL_PROB_IMPROVEMENT = 0.03  # v5.4: 0.3→0.03; aligns local PnL to cloud (~3k-5k)
+FILL_PROB_QUEUE       = 0.02  # v5.4: 0.1→0.02
 
 def match_orders(orders: dict, market_bids: dict, market_asks: dict,
                  positions: dict, cash: dict) -> list[tuple]:
@@ -382,6 +388,7 @@ def run_backtest(filepath: str, output_dir: str = "."):
     positions = defaultdict(int)   # product -> 当前仓位
     cash = defaultdict(float)      # product -> 累计现金流
     trader_data = ""               # Trader 跨 tick 状态字符串
+    last_valid_mid: dict = {}      # v5.4: forward-fill mid prices; prevents pos*0 MTM spike
 
     # 结果记录
     results = []
@@ -422,8 +429,18 @@ def run_backtest(filepath: str, output_dir: str = "."):
         # Step 3: 撮合 + 算账
         fills = match_orders(orders, market_bids, market_asks, positions, cash)
 
-        # Step 4: 盯市估值
-        pnl = calc_mtm_pnl(cash, positions, mid_prices)
+        # Step 4: 盯市估值 (v5.4: forward-fill missing mid prices)
+        for product, mp in mid_prices.items():
+            if mp != 0.0:
+                last_valid_mid[product] = mp
+        filled_mid_prices = {}
+        all_products = set(list(cash.keys()) + list(positions.keys()) + list(mid_prices.keys()))
+        for p in all_products:
+            if p in mid_prices and mid_prices[p] != 0.0:
+                filled_mid_prices[p] = mid_prices[p]
+            else:
+                filled_mid_prices[p] = last_valid_mid.get(p, 0.0)
+        pnl = calc_mtm_pnl(cash, positions, filled_mid_prices)
 
         # 记录本 tick 结果
         results.append({"tick": tick_index, "pnl": pnl, "fills": len(fills)})

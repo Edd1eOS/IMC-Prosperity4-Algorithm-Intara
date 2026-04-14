@@ -106,3 +106,92 @@
 **Result**:
 - Code compiles (only expected `datamodel` import warning)
 - Awaiting backtester verification
+
+## Entry 5 — Round 1 Complete Strategy Rewrite (v5)
+
+**Date**: 2026-04-14
+
+**What changed**:
+- Renamed strategy file from `tut_round_trader.py` to `round1_trader.py`; updated `backtester.py` import accordingly
+- Identified actual Round 1 products by analyzing official CSV data:
+  - `ASH_COATED_OSMIUM`: std≈5, mean≈10000 across all 3 days → fixed FV asset (replaces EMERALDS role)
+  - `INTARIAN_PEPPER_ROOT`: trends +1000/day (10000→11000→12000→13000), std≈288 → trend asset (replaces TOMATOES role)
+- Introduced four major architectural changes:
+
+  **1. State Persistence**: `traderData` JSON stores `ppr_history` (up to 20 micro-prices for PEPPER_ROOT EMA). Wrapped in `try/except` — parse failures initialize empty dict silently.
+
+  **2. Aggressive Taker Logic**: New `aggressive_take_and_mm()` helper. Phase 1 sweeps all asks strictly below FV (buy) and all bids strictly above FV (sell) at 100% V3 fill probability. Uses `sim_pos` to track cumulative intent and never exceed `±limit`.
+
+  **3. Dynamic Fair Value for PEPPER_ROOT**: `compute_microprice()` computes volume-weighted mid (bid*q_ask + ask*q_bid) / (q_bid+q_ask). EMA(alpha=0.2) over rolling 20 micro-prices. Final FV = 70% EMA + 30% micro-price for trend stability with current-book correction.
+
+  **4. Inventory-Skewed MM with Two Critical Guards**:
+     - *Quote non-crossing clamp*: `mm_bid = min(mm_bid, best_ask - 1)`, `mm_ask = max(mm_ask, best_bid + 1)` — prevents V3 engine from classifying passive MM orders as Taker (100% fill)
+     - *MAX_MM_LOT = 15*: caps single MM order at 15 lots — prevents a single 30%-probability fill from swinging position 160 lots from one extreme to the other
+
+- Replaced flat `TRADING_CONFIG` with OSM/PPR-specific constants; removed unused `clamp_order_volume()` helper
+- Replaced verbose per-tick book print with compact `OSM | pos= | fv=` and `PPR | pos= | ema= | micro= | fv=` log lines
+
+**Why**:
+- Round 1 launched; actual products differ completely from tutorial round names
+- Old strategy had no aggressive taker → missed all 100% Taker fill opportunities
+- Old fixed 1-lot sizing → near-zero capital utilization under limit=80
+- No `traderData` state → PEPPER_ROOT EMA impossible; every tick was stateless
+- Without MAX_MM_LOT cap: at pos=±80, remaining capacity is 160; a single 30%-probability fill causes 160-lot swing across the full range → systematic round-trip losses at every spread crossing
+
+**Debug History**:
+- v5.0 (product names only): 0 fills — `EMERALDS`/`TOMATOES` not in Round1 book
+- v5.1 (renamed products, no guards): PnL = -11,840,252; 160-lot oscillations at ±80 every ~2 ticks
+- v5.2 (+ non-crossing clamp): PnL = -4,702,558; taker fills eliminated but lot-size bombs remained
+- v5.3 (+ MAX_MM_LOT=15): PnL positive, all 3 days verified
+
+**Result** (V3 stochastic engine, random.seed(42)):
+- Day -2: 7127 ticks with fills, PnL = **+66,013.50**
+- Day -1: 7180 ticks with fills, PnL = **+77,964.00**
+- Day  0: 7218 ticks with fills, PnL = **+60,143.00**
+- 3-day total: **+204,120.50**
+
+**Effective**: Yes — first strategy to produce positive PnL on Round 1 data
+
+## Entry 6 — v5.4: Backtester Calibration + Dynamic OSM FV + Non-linear Skew
+
+**Date**: 2026-04-14
+
+**What changed**:
+
+### backtester.py
+- `FILL_PROB_IMPROVEMENT`: 0.3 → **0.03**；`FILL_PROB_QUEUE`: 0.1 → **0.02**
+  - 目的：将本地 PnL 绝对值从 ~6万/天 压制至 ~1.3万/天，与云端实盘（2508）对齐量级
+- **MTM 前向填充（Forward-fill）**：新增 `last_valid_mid` 字典，在每个 tick 更新有效 mid_price；构建 `filled_mid_prices` 时采用显式循环——优先取当前有效值，缺失则回落至历史最后有效值，防止 `pos × 0` 导致 MTM 估值骤降/骤升
+
+### round1_trader.py
+- `import math` 加入（用于 `math.exp()`）
+- **OSM 动态 FV**（替换硬编码 10000）：
+  - 新增 `OSM_EMA_ALPHA=0.05`（慢 EMA，约19期）、`OSM_MICRO_WEIGHT=0.2`、`OSM_MIN_HISTORY=3`
+  - 新增 `osm_history` 列表存入 `traderData` JSON，跨 tick 持久化
+  - FV = `0.8 × slow_EMA + 0.2 × microprice`；冷启动或盘口真空时坚守 `OSM_FV=10000`（Patch 2：防冷启动震荡）
+- **非线性指数库存偏斜** `compute_skew()`：
+  - `|pos| < 0.75 × limit`：线性区，等同 v5.3 的 `int(alpha × pos)`
+  - `|pos| ≥ 0.75 × limit`（即 pos≥60）：指数区，`raw = alpha × |pos| × exp(k × excess / limit)`，`k=2.0`
+  - 关键数值：pos=60→skew=6，pos=70→skew=8，pos=78→skew=12
+- **单边报价压制**：`|pos| ≥ 0.875 × limit`（即 pos≥70）时，压制增仓方向的 MM 挂单（`buy_cap=0` 或 `sell_cap=0`）
+  - **仅作用于 Phase 2 Maker 层**，Phase 1 主动吃单逻辑不受影响（Patch 3 澄清）
+- 移除 Module 2 和 Module 3 的冗余 `print` 语句，防止云端日志配额超限
+
+**Why**:
+- 云端实盘 PnL=2508 vs 本地 PnL=66k：回测器过度乐观，需压缩到可信量级以评估真实改进
+- OSM 硬编码 FV=10000 在价格漂移（如跌至 9980）时导致持续买入、仓位套牢无法平仓
+- 线性偏斜 `int(0.1 × 70) = 7` 不够强——指数偏斜在极端仓位时更激进地推动价格回归
+- 单边压制防止在深度持仓时继续挂增仓方向的被动单，主动减少逆向选择风险
+
+**Result** (V3 stochastic engine, random.seed=42):
+
+| Day | 成交 ticks | Final PnL |
+|-----|-----------|-----------|
+| Day -2 | 1419 / 10000 | **+13,022.00** |
+| Day -1 | 1437 / 10000 | **+13,636.00** |
+| Day  0 | 1428 / 10000 | **+13,554.00** |
+| **3日合计** | | **+40,212.00** |
+
+注：成交 ticks 大幅下降（7000+ → 1400+）是 fill prob 降低的直接结果，属预期行为。
+
+**Effective**: Yes — 回测器失真修复；OSM 仓位结尾不再钉在 ±80（各天末：47 / 27 / -42），库存偏斜防御效果提升
