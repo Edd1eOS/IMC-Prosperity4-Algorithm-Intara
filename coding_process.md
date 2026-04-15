@@ -195,3 +195,368 @@
 注：成交 ticks 大幅下降（7000+ → 1400+）是 fill prob 降低的直接结果，属预期行为。
 
 **Effective**: Yes — 回测器失真修复；OSM 仓位结尾不再钉在 ±80（各天末：47 / 27 / -42），库存偏斜防御效果提升
+
+## Entry 7 — Diagnostics-Only Batch: Attribution Instrumentation (2026-04-15)
+
+**Date**: 2026-04-15
+
+**Batch type**: DIAGNOSTICS ONLY — no strategy logic changed.
+
+**What was instrumented**:
+
+### backtester.py
+- Added `p2_ppr_posted_below_30` counter to `_fresh_diag()` — tracks Phase 2 maker sell
+  orders posted at PPR position ≤ -30 (intent volume, separate from fill volume)
+- Added `pos_at_start` capture per product in `match_orders()` — position before any
+  fills this tick, used as the posted-intent proxy for the new counter
+- Added posted-intent counting loop: Phase 2 sell identified by `order.price > best_bid`
+  (Phase 1 takers always have `order.price <= best_bid`; non-crossing clamp ensures Phase 2
+  always has `order.price >= best_bid + 1`)
+- Updated `_print_day_diagnostics()` to print all three Diag 2 lines:
+  Phase-1 filled, Phase-2 posted (intent), Phase-2 filled
+
+All other diagnostic infrastructure (Diag 1 asset MTM PnL, Diag 2 fill attribution,
+Diag 3 saturation dwell, day boundary detection) was already present in backtester.py.
+
+### round1_trader.py
+- Set `DIAG_MODE = True` to enable Diagnostic 4 prints:
+  `[DIAG_P1]` Phase 1b sell-taker events (bid, fv, delta, pos) at PPR pos ≤ -30
+  `[DIAG_P2_POST]` Phase 2 sell posting events at PPR pos ≤ -30
+- NOTE: DIAG_MODE must be reset to False before cloud submission
+
+**Why no strategy logic was changed**:
+The goal of this batch was purely diagnostic attribution — to determine whether PPR or OSM
+is the dominant saturation bottleneck, and whether Phase 1 or Phase 2 is the larger
+short-builder on PPR. No conclusions about the answers were assumed before running.
+Changing strategy logic before reading diagnostics would make the diagnostic results
+uninterpretable (we would not know whether any PnL change came from the instrumentation
+or from the strategy change).
+
+**Questions this batch was designed to answer**:
+1. Which asset is the dominant saturation bottleneck: OSM or PPR?
+2. On PPR, is Phase 1 taker or Phase 2 maker the larger contributor to short build-up?
+3. Is short saturation severe enough to justify Change 1, Change 2, or both?
+4. Should OSM be reprioritized before any PPR change?
+
+**Diagnostic results summary** (full details in Backtest_Reports/Round1/diag_overview.txt):
+- OSM is the dominant bottleneck: >=+80 for 596 ticks (2.0% avg), <=−80 for 206 ticks (0.7% avg)
+- PPR is mild: <=−80 for only 7 ticks (0.02% avg) across all 3 days
+- Phase 2 is the dominant PPR short-builder (3:1 ratio over Phase 1 at pos ≤ -30)
+- All Phase 1 sells at pos ≤ -30 fired on marginal alpha (delta 1-2 only, no delta ≥ 5)
+- OSM generated only +36 PnL across 3 days and was negative on Day 0 (-2780)
+
+**Recommendation from diagnostics**: Re-evaluate OSM first (Change 4: OSM microprice
+weight reduction 0.45 → 0.25). Do not implement Change 1 or Change 2 yet.
+
+**Effective**: Yes — diagnostic instrumentation complete; all four diagnostic outputs
+produced and saved.
+
+## Entry 8 — Change 4: OSM Microprice Weight Reduction (v5.6) (2026-04-15)
+
+**Date**: 2026-04-15
+
+**Batch type**: Single targeted parameter change (Change 4 only).
+
+**Diagnostics conclusion that justified this change**:
+
+The 2026-04-15 diagnostics batch (Entry 7) produced the following findings:
+- OSM is the dominant saturation bottleneck. OSM was at ≥+80 for 596 ticks across 3 days
+  (2.0% average, peaking at 3.47% on Day 0). PPR was at ≤−80 for only 7 ticks (0.02% avg).
+  OSM saturation is 85× worse than PPR at the hard limit.
+- OSM MTM PnL was near-zero over 3 days (+36 total) and negative on Day 0 (−2,780).
+  On Day 0, OSM was bi-directionally saturated: it reached ≥+80 (347 ticks) and ≤−80 (203 ticks)
+  within the same day, indicating the FV mean-reversion signal failed completely.
+- OSM ≥+70 dwell time averaged 5.5% of ticks — well above the plan's 5% materiality threshold.
+- PPR short saturation (≤−70: 1.1% avg) was below threshold. PPR generates 99.9% of all PnL.
+- The root cause hypothesis: OSM_MICRO_WEIGHT=0.45 makes the FV too reactive to transient
+  book imbalances. A momentary microprice spike fires Phase 1 taker buys before the slow EMA
+  (alpha=0.05, ~19 periods) can correct the FV anchor, driving the position into saturation.
+
+**Exact parameters changed**:
+
+| Parameter | Before (v5.5) | After (v5.6) | File | Line |
+|---|---|---|---|---|
+| `OSM_MICRO_WEIGHT` | 0.45 | 0.25 | round1_trader.py | 60 |
+| `DIAG_MODE` | True | False | round1_trader.py | 82 |
+
+DIAG_MODE was True only for the diagnostics batch. This restores the cloud-safe state.
+
+**Behavioral meaning of the change**:
+
+OSM fair value is computed as:
+  `osm_fv = (1 - OSM_MICRO_WEIGHT) * slow_ema + OSM_MICRO_WEIGHT * microprice`
+
+At 0.45: a 15-unit transient microprice deviation moves FV by ±6.75 units.
+At 0.25: the same deviation moves FV by ±3.75 units — a 44% reduction in FV sensitivity.
+
+The slow EMA (alpha=0.05, ~19 periods) now anchors 75% of FV instead of 55%.
+Spurious Phase 1 taker buy triggers from downward microprice spikes are reduced.
+Phase 1 sell triggers from upward spikes are similarly reduced.
+The strategy's effective FV remains accurate for sustained price moves but no longer
+overreacts to single-tick book imbalances.
+
+**Why this should reduce OSM saturation risk**:
+- Fewer Phase 1 taker buys triggered near the ±60–80 saturation zone
+- FV less likely to drift away from the slow EMA anchor on transient events
+- OSM bi-directional saturation (hit both ≥+80 and ≤−80 in same day) requires
+  repeated FV miscalculations in both directions — reducing FV reactivity addresses both sides
+- The change is cloud-transferable: Phase 1 taker fills are 100% in cloud and local;
+  fewer taker triggers means fewer fills at the margin, independently of fill probability
+
+**PPR logic intentionally left unchanged**:
+No PPR parameters, thresholds, or logic were modified in this batch. The change is
+strictly OSM-scoped. This preserves interpretability: any PnL or saturation change
+observed after deployment is attributable solely to the OSM FV sensitivity reduction.
+
+**Validation result** (2026-04-15, seed=42):
+
+| Metric | v5.5 baseline | v5.6 tested | Verdict |
+|---|---|---|---|
+| OSM ≥+80 (3-day) | 596 ticks | 361 ticks (−39%) | ✓ long improved |
+| OSM ≥+70 (3-day) | 1,638 ticks | 1,428 ticks (−13%) | ✓ modest |
+| OSM ≤−80 (3-day) | 206 ticks | 280 ticks (+36%) | ✗ short worsened |
+| OSM ≤−70 (3-day) | 508 ticks | 1,175 ticks (+131%) | ✗✗ short worsened sharply |
+| OSM MTM PnL total | +36 | +130 | ✓ marginal |
+| OSM Day -1 PnL | +1,703 | +2,605 | ✓ |
+| OSM Day -2 PnL | +1,113 | −306 | ✗ turned negative |
+| PPR / total PnL | — | — | ✗ INVALID (RNG state contamination) |
+
+**Root cause of failure**: OSM_MICRO_WEIGHT is a symmetric parameter. Reducing it makes FV less
+reactive to ALL transient book moves, in both directions. When the market spikes upward, the lower
+FV causes more bids to appear "above FV", triggering Phase 1 sell takers aggressively — this drove
+Day -1 OSM ≤-70 from 20 ticks to 554 ticks (27×). The parameter redistributed saturation from long
+to short without eliminating it. Net total extreme-saturation (≥+80 + ≤-80): 802 → 641, only −20%.
+
+**Note on PPR/total PnL comparison**: The PPR and total PnL numbers differ wildly between v5.5
+and v5.6 (e.g., Day -2 PPR: 9,337 → 18,490). This is a RNG state artifact, not real behavior.
+Different OSM taker order counts per tick shift the random() call sequence for PPR fills. Only
+OSM-specific metrics are valid cross-version comparisons.
+
+**Decision**: REVERTED. OSM_MICRO_WEIGHT restored to 0.45. Change 4 in this form (0.25) is a
+FAIL — it shifted saturation from long to short side without structural improvement.
+
+**Parameter state after revert**: OSM_MICRO_WEIGHT = 0.45, DIAG_MODE = False (cloud-safe).
+
+**Next batch options**:
+- Path A: Try OSM_MICRO_WEIGHT = 0.35 (moderate reduction; may reduce long saturation with less
+  symmetric short saturation blowup, since the effect is smaller per unit of market move)
+- Path B: Add OSM Phase 1 bilateral position gate (taker_buy_gate = +40, taker_sell_gate = −40),
+  directly capping how deep Phase 1 can push OSM position in either direction, independent of FV.
+
+## Entry 9 — Change 4 Experiment Closed / Rollback Confirmed (2026-04-15)
+
+**Date**: 2026-04-15
+
+**Batch type**: Rollback confirmation and experiment closure. No new logic introduced.
+
+**What was rolled back**:
+- `OSM_MICRO_WEIGHT`: reverted from 0.25 (Change 4 test value) back to **0.45** (v5.5 baseline)
+- `DIAG_MODE`: confirmed **False** (was already False; cloud-safe)
+- All other parameters unchanged throughout
+
+The v5.6 changelog comment block in `round1_trader.py` is retained as an inline record of the
+failed experiment. The active trading logic is v5.5.
+
+**Why rollback was necessary**:
+Change 4 (OSM_MICRO_WEIGHT 0.45 → 0.25) produced the following local test outcome:
+- OSM long saturation (≥+80) reduced: 596 → 361 ticks (−39%) — intended improvement
+- OSM short saturation (≤−70) worsened: 508 → 1175 ticks (+131%) — unintended regression
+- Day -1 OSM ≤−70 exploded: 20 → 554 ticks (+27×) — single worst-case regression
+- OSM total MTM PnL: +36 → +130 — improvement negligible
+- Cloud PnL also deteriorated relative to the prior baseline (confirmed by user)
+
+Root cause: `OSM_MICRO_WEIGHT` is symmetric. Reducing it dampens FV reactivity in both
+directions equally. When the market spikes upward, the lower FV causes Phase 1 sell takers to
+trigger more aggressively — building short positions that saturate. The parameter cannot be
+used alone to fix one-sided (long) saturation without creating opposite (short) saturation.
+
+**Evidence preserved for future batches**:
+- Local test raw output: `Backtest_Reports/Round1/v5.6_Change4/raw_day_{minus2,minus1,0}.txt`
+- Per-day diagnostic summaries: `diag_summary_day_{minus2,minus1,0}.txt`
+- Diagnostic overview with analysis: `diag_overview.txt`
+- Coding process entries (Entry 8 + 9): full failure analysis and root cause
+- Testing execution log (Run 14 + rollback record): before/after metrics table
+
+**Active baseline after rollback**:
+v5.5 logic, confirmed by safety check (13 parameters verified against expected values):
+  `OSM_MICRO_WEIGHT = 0.45`, `DIAG_MODE = False`, all other constants unchanged.
+File is cloud-submission safe.
+
+**Change 4 experiment: CLOSED.**
+
+**Next candidate directions** (to be decided in a separate batch):
+
+Path A — OSM_MICRO_WEIGHT = 0.35 (moderate reduction):
+  Smaller step than 0.25. May yield partial long saturation reduction without triggering
+  the symmetric short saturation blowup observed at 0.25. Lower risk, but still uses the
+  same symmetric mechanism — may simply produce a smaller version of the same failure.
+
+Path B — OSM bilateral Phase 1 position gate (preferred candidate):
+  Add `taker_buy_gate = +40` and `taker_sell_gate = −40` inside `aggressive_take_and_mm`
+  for OSM only. When `sim_pos >= +40`, Phase 1 taker buys stop. When `sim_pos <= −40`,
+  Phase 1 taker sells stop. This caps how deep Phase 1 drives OSM inventory in either
+  direction, regardless of FV computation. Cloud-transferable (Phase 1 = 100% fill in
+  cloud and local). Can be set asymmetrically (e.g., buy_gate = +40, sell_gate = −50)
+  to match the observed asymmetry in saturation data. Does not touch FV, skew, or maker
+  logic — cleanly isolated and interpretable.
+
+## Entry 10 — v5.7: Path B — OSM Phase 1 双向仓位门控
+
+**Date**: 2026-04-15
+
+**Batch type**: Path B — 针对 OSM 的 Phase 1 吃单深度直接门控。单一、定向、机制级别的干预。
+
+**Change 4 被拒的原因（不再试 Path A 的理由）**:
+
+Change 4 实验（v5.6，`OSM_MICRO_WEIGHT 0.45 → 0.25`）已明确证明 `OSM_MICRO_WEIGHT`
+是对称参数：降低它后，FV 对上行脉冲同等减感，导致 Phase 1 卖单大量触发、短侧饱和爆炸。
+Day -1 OSM ≤-70 从 20 → 554 ticks (+27倍)，比原始长侧问题更严重。
+Path A（0.35 中间值）使用同一个有缺陷的机制，只是步长更小；它无法从机制上隔离单侧饱和，
+只会产生"副作用稍小的 Change 4 重演"。Path B 完全绕过 FV 计算，直接在仓位层面截断 Phase 1
+推力，是更干净、更可解释、云端可移植的改动。
+
+**新增参数（仅 OSM 调用处传入，PPR 维持 None）**:
+
+| 参数 | 值 | 含义 |
+|-----|-----|------|
+| `taker_buy_gate` | +40 | sim_pos >= +40 时 Phase 1a 停止主动买入吃单 |
+| `taker_sell_gate` | -40 | sim_pos <= -40 时 Phase 1b 停止主动卖出吃单 |
+
+**代码变更明细**:
+
+| 位置 | 改动 |
+|------|------|
+| `aggressive_take_and_mm()` 函数签名 | 新增 `taker_buy_gate: int | None = None` 和 `taker_sell_gate: int | None = None` 两个可选参数 |
+| Phase 1a 循环（`ask_price` 遍历）| FV 检查后增加：`if taker_buy_gate is not None and sim_pos >= taker_buy_gate: break` |
+| Phase 1b 循环（`bid_price` 遍历）| FV 检查后增加：`if taker_sell_gate is not None and sim_pos <= taker_sell_gate: break` |
+| Module 2 OSM 调用处 | 新增 `taker_buy_gate=40, taker_sell_gate=-40` 关键字参数 |
+| Module 3 PPR 调用处 | 未变动，两参数默认为 `None`（行为不变） |
+
+**期望效果（OSM 饱和与前半段容量）**:
+
+1. Phase 1 每个 tick 最多将 OSM 推至 ±40（由 sim_pos 追踪，填单逻辑不变）
+2. ±40 到 ±80 区间只能通过 Phase 2 被动做市（Maker，填单率约 3%）触达，
+   天然形成速率节流，极端区域停留时间应大幅缩短
+3. 当市场需要反向平仓时，OSM 从 ±40 出发（而非 ±80），有更大空间做双向做市，
+   预计前半段 PnL 曲线不再呈长时间水平段
+
+**刻意保持不变的部分**:
+- `OSM_MICRO_WEIGHT`, `OSM_EMA_ALPHA`, `OSM_FV` 和所有 FV 公式 — 不变
+- `compute_skew()`, `SKEW_K`, `SKEW_THRESHOLD`, `ONE_SIDE_FRAC` — 不变
+- `MAX_MM_LOT`, `PPR_LIMIT`, `EMA_ALPHA`, `MICRO_WEIGHT` 等所有其他参数 — 不变
+- DIAG_MODE = False（云端安全）
+- PPR 的整个 Module 3 逻辑 — 完全不变（taker gate 均为 None）
+
+**Cloud result**: FAIL — PnL = 2205 (vs v5.4 target 2441). Same as v5.6 Change 4.
+Root cause: gate was applied on top of v5.5 parameters; could not exceed the v5.5 performance ceiling.
+**Decision**: REVERTED in v5.8 along with all v5.5 parameter changes.
+
+## Entry 11 — v5.8: 完整回滚至 v5.4 参数基线
+
+**Date**: 2026-04-15
+
+**Batch type**: 回滚。无新策略逻辑。
+
+**回滚动机**:
+
+v5.6（Change 4）和 v5.7（Path B）均在 v5.5 参数基础上改动，云端 PnL 均为 ~2205，
+低于 v5.4 基准的 2441。根本原因是 v5.5 引入的三个参数（见下表）把云端性能从 2441
+压低至 ~2205，后续所有 v5.5 基础上的实验都无法突破这个上限。
+
+**回滚内容**:
+
+| 参数 | v5.5（被回滚值）| v5.8（恢复值）| 恢复依据 |
+|------|--------------|-------------|---------|
+| `OSM_MICRO_WEIGHT` | 0.45 | **0.20** | v5.4 原始值 |
+| `SKEW_K` | 3.0 | **2.0** | v5.4 原始值 |
+| `SKEW_THRESHOLD` | 0.60 | **0.75** | v5.4 原始值 |
+| Phase 1 gate (v5.7) | taker_buy_gate=40, taker_sell_gate=-40 | **移除** | v5.7 REVERTED |
+
+**保留不变（v5.4 已有架构）**:
+- 动态 OSM FV（慢EMA + microprice 混合），`fv_int = round(fv)` bug fix
+- `osm_history` 跨 tick 状态持久化
+- `microprice` 函数参数（无害，不影响行为）
+- DIAG_MODE = False（云端安全）
+
+**本地验证**（seed=42，v5.4 基准逐位吻合）:
+
+| Day | v5.4 基准 | v5.8 结果 | 末仓 OSM/PPR |
+|-----|----------|----------|-------------|
+| Day -2 | +13,022 | +13,022 | OSM=+47, PPR=+75 |
+| Day -1 | +13,636 | +13,636 | OSM=+27, PPR=-71 |
+| Day  0 | +13,554 | +13,554 | OSM=-42, PPR=-33 |
+| **合计** | **+40,212** | **+40,212** | — |
+
+本地结果完全吻合，证明 v5.8 精确还原了 v5.4 交易行为。
+
+**云端目标**: 恢复至 2441 水平。
+
+**Effective**: 待云端验证
+
+---
+
+## Entry 12 — v6.0: Three-Layer Upgrade (Kalman FV + Position-Aware Phase 1 + AS Dynamic Spread)
+
+**Date**: 2026-04-15
+
+**Batch type**: 重大升级 — 针对 OSM 饱和、冷启动死区、Phase 2 点差收益三项核心瓶颈。
+
+**Motivation**: 云端 PnL 2441 / 100K ticks，目标 ≥ 4000。PnL 曲线 0–40K ticks 平滞（占 40%
+时间无收益），40–100K 急速拉升。理论上若能填平死区，目标为 2441/0.6 ≈ 4068 可达。
+
+**三项核心改动**:
+
+### 改动 1 — OSM FV: EMA混合 → 1D Kalman Filter
+
+- **替换**: `FV = 0.8×EMA(α=0.05) + 0.2×microprice`（有效α≈0.24，过快追价）
+- **新增**: `kalman_update_1d(x, P, z, Q=0.005, R=4.0)`，P₀=25
+- 冷启动：K₀ = 25/(25+4) ≈ 0.86，第1个tick立即收敛到首次观测值
+- 稳态：K ≈ 0.034，比原EMA慢7×，FV牢锚在10000附近
+- 预期效果：消灭开盘30tick"热机死区"，同时减少FV漂移至10001导致的虚假吃单
+
+### 改动 2 — Phase 1 仓位感知阈值（OSM专属，PPR零影响）
+
+- 新增参数 `OSM_TAKER_ALPHA = 0.1`（与 OSM_ALPHA 一致）
+- Phase 1a 买入阈值：`fv_int - int(0.1 × max(sim_pos, 0))`
+  - pos=0: 阈值=fv_int（无变化）
+  - pos=+40: 阈值=fv_int-4（需4tick优势才买）
+  - pos=+80: 阈值=fv_int-8（OSM std=5，-8tick极罕见 → 几乎停止买入）
+- Phase 1b 卖出阈值：`fv_int + int(0.1 × max(-sim_pos, 0))`（对称）
+- PPR 调用传 `taker_alpha=0.0` → 阈值等价于原 fv_int，完全无影响
+- 预期效果：OSM 长仓饱和从 596 ticks/100K → <150 ticks/100K
+
+### 改动 3 — Phase 2 AS 动态点差（双资产）
+
+- 新增 `compute_micro_vol(prices, lookback=10)` 计算滚动σ
+- 公式：`δ_raw = max(1, round(γ × σ))`, `δ_eff = min(δ_raw, (best_ask-best_bid)//2)`
+- **OSM**: `OSM_AS_GAMMA=2.0` + 书册上限=1（OSM买卖差通常=2） → δ恒为1（零副作用）
+- **PPR**: `PPR_AS_GAMMA=0.15` + 宽买卖差 → σ≥10时δ→2，同等成交概率(30%)但每笔多赚1tick
+- 新增 `half_spread` 参数加入 `aggressive_take_and_mm()` 签名（默认=1，向后兼容）
+- 预期效果：PPR Phase 2 高波动期收益约翻倍
+
+**新增常量**:
+
+| 常量 | 值 | 说明 |
+|------|---|------|
+| `OSM_KALMAN_Q` | 0.005 | Kalman过程噪声 |
+| `OSM_KALMAN_R` | 4.0 | Kalman观测噪声 |
+| `OSM_KALMAN_P0` | 25.0 | Kalman初始协方差 |
+| `OSM_TAKER_ALPHA` | 0.1 | Phase 1 仓位惩罚系数 |
+| `OSM_AS_GAMMA` | 2.0 | OSM AS点差风险厌恶系数 |
+| `PPR_AS_GAMMA` | 0.15 | PPR AS点差风险厌恶系数 |
+| `AS_VOL_LOOKBACK` | 10 | AS微观波动率滚动窗口 |
+
+**本地验证目标**: 3天总 PnL > 48,000（v5.8基线 40,212，+20%）
+
+**云端目标**: ≥ 3,200 XIREC / 100K ticks，力争 ≥ 4,000
+
+**后参数调优指导**:
+- 若OSM仍饱和：将 `OSM_TAKER_ALPHA` 从 0.1 提升至 0.15
+- 若PPR spread始终=1：将 `PPR_AS_GAMMA` 从 0.15 提升至 0.20
+- 若Kalman FV追踪过慢：将 `OSM_KALMAN_Q` 从 0.005 提升至 0.01
+
+**云端实测结果**: **3,352 XIREC / 100K ticks**（v5.8基线 2,441，+**37.3%**）✅
+- 三项改动均有效，无需回滚
+- 距离 4,000 目标还差 648（-16.2%），下一步聚焦进一步压缩OSM饱和或提升PPR点差
+
+**Effective**: 2026-04-16 云端验证通过

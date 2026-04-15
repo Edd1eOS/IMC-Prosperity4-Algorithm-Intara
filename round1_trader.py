@@ -1,6 +1,6 @@
 """
-round1_trader.py — IMC Prosperity 4 Round 1 策略
-================================================
+round1_trader.py — IMC Prosperity 4 Round 1 策略  [v6.0]
+=========================================================
 资产（Round 1 实际产品名）：
   ASH_COATED_OSMIUM    — 固定FV资产（FV=10000，std≈5，均值钉在10000，仓位±80）
   INTARIAN_PEPPER_ROOT — 趋势资产（每天涨+1000，需EMA动态FV，仓位±80）
@@ -11,6 +11,71 @@ round1_trader.py — IMC Prosperity 4 Round 1 策略
   3. INTARIAN_PEPPER_ROOT：EMA+微观价格修正 = 动态FV，复用同一吃单+做市逻辑
   4. 防御：双层 try/except 隔离 + 最终头寸钳制
 """
+# ================================================================
+# CHANGELOG v6.0（相对 v5.8）— 三层升级
+# 改动 1: OSM FV: EMA混合 → 1D Kalman(Q=0.005, R=4.0, P₀=25)
+#   · 冷启动K₀≈0.86（立即收敛），稳态K≈0.034（7×慢于EMA有效α=0.24）
+#   · 彻底消除开盘30tick"热机死区"
+# 改动 2: Phase 1 仓位感知阈值（仅OSM，OSM_TAKER_ALPHA=0.1）
+#   · 买入阈值: fv - int(0.1 * max(sim_pos, 0))；pos=+80时需ask<fv-8
+#   · 根治OSM长仓饱和（目标：596 ticks→<150 ticks）
+# 改动 3: Phase 2 AS动态点差（双资产）
+#   · δ_raw = max(1, round(γ×σ_micro))；book_half上限防止出市报价
+#   · OSM: γ=2.0 + book_half=1上限 → δ恒为1（零副作用）
+#   · PPR: γ=0.15 + 宽买卖差 → σ≥10时δ→2，每笔成交收益翻倍
+# 云端目标: ≥3200 XIREC/100K ticks（基线2441）
+# ================================================================
+# CHANGELOG v5.8（相对 v5.4）— 完整回滚至 v5.4 参数基线
+# 回滚原因:
+#   v5.6 (Change 4: OSM_MICRO_WEIGHT 0.45→0.25) 云端 PnL ≈2205，低于 v5.4 的 2441
+#   v5.7 (Path B: Phase 1 gate ±40) 云端 PnL ≈2205，同样低于 v5.4
+#   v5.6 和 v5.7 均在 v5.5 参数基础上改动，无法突破 v5.5 造成的性能上限
+#   根因：v5.5 引入的三个参数（OSM_MICRO_WEIGHT 0.20→0.45, SKEW_K 2.0→3.0,
+#         SKEW_THRESHOLD 0.75→0.60）使云端 PnL 从 2441 下降至 ~2205
+# 本次回滚内容:
+#   OSM_MICRO_WEIGHT : 0.45 → 0.20  （v5.4 原始值）
+#   SKEW_K           : 3.0  → 2.0   （v5.4 原始值）
+#   SKEW_THRESHOLD   : 0.60 → 0.75  （v5.4 原始值）
+#   Phase 1 gate (v5.7) 完全移除
+# 保留不变（v5.4 已有架构）:
+#   动态 OSM FV（慢EMA + microprice 混合）
+#   osm_history 状态持久化
+#   fv_int = round(fv) 取整修复
+#   microprice 参数（无害，不影响逻辑）
+#   DIAG_MODE = False（云端安全）
+# ================================================================
+# CHANGELOG v5.7（相对 v5.5）— Path B: OSM Phase 1 双向仓位门控 — REVERTED
+# 新增参数 (已移除):
+#   taker_buy_gate  = +40
+#   taker_sell_gate = -40
+# 云端结果: PnL = 2205（与 v5.6 相同，低于 v5.4 基准 2441）→ CLOSED
+# ================================================================
+# CHANGELOG v5.6（相对 v5.5）— Change 4 batch — REVERTED
+# 试验参数:
+#   OSM_MICRO_WEIGHT : 0.45 → 0.25  （已回滚回 0.45）
+# 测试结论:
+#   0.25 权重令 FV 对上行脉冲不敏感 → Phase 1 卖单大量触发 → 短侧饱和
+#   Day -1 OSM ≤-70：20 → 554 tick (+27倍)；短侧饱和比原始问题更严重
+#   OSM 总 MTM PnL 仅从 +36 微升至 +130，改善可忽略
+#   长侧饱和改善(≥+80: -39%)但短侧同等恶化(≤-70: +131%)，参数影响对称
+#   → OSM_MICRO_WEIGHT 是对称参数，无法单独修复单侧饱和
+# 下一步方向:
+#   Path A: 试验中间值 OSM_MICRO_WEIGHT=0.35（温和调低）
+#   Path B: 增加 OSM Phase 1 仓位门控（±40 硬盖），直接限制吃单深度
+#   DIAG_MODE 仍保持 False（云端安全状态）
+# ================================================================
+# CHANGELOG v5.5（相对 v5.4）
+# 参数变动对照表:
+#   OSM_MICRO_WEIGHT : 0.20 → 0.45  更激进的微价格权重，早捕均值回归
+#   SKEW_THRESHOLD   : 0.75 → 0.60  指数惩罚门槛提前，减少中等仓位积累
+#   SKEW_K           : 2.0  → 3.0   极端仓位惩罚更陡，加速去化
+#   JUMP_THRESHOLD   : 新增 15      microprice 偏离 FV > 15 时扩大 spread
+# 逻辑增强:
+#   compute_skew()         : exp 指数加 min(..., 20) 安全钳制，防未来参数引发溢出
+#   aggressive_take_and_mm(): fv_int=int(round(fv)) 消除取整偏误
+#   aggressive_take_and_mm(): 新增 microprice 参数 + 双向跳变过滤
+#   PPR 调用处             : 不传 microprice（默认 None），不触发跳变过滤
+#   序列化                 : osm/ppr_history 严格裁剪至 MAX_HISTORY=20
 # ================================================================
 # CHANGELOG v5.4
 # - OSM FV: 硬编码10000 → 慢EMA(alpha=0.05) + 微观价格混合; 冷启动期坚守10000
@@ -32,8 +97,22 @@ OSM_FV           = 10_000    # 冷启动/盘口真空时的兜底公允价值
 OSM_LIMIT        = 80        # 仓位硬上限（绝对值）
 OSM_ALPHA        = 0.1       # 库存偏斜系数
 OSM_EMA_ALPHA    = 0.05      # v5.4: 慢EMA平滑因子（约19期）；追踪长期漂移
-OSM_MICRO_WEIGHT = 0.2       # v5.4: 微观价格权重（20%，比PPR更保守）
+OSM_MICRO_WEIGHT = 0.20      # v5.8: 回滚至v5.4原始值（20%）; v5.5升至0.45后云端PnL从2441降至~2205
 OSM_MIN_HISTORY  = 3         # v5.4: EMA预热最小历史点数
+
+# --- v6.0: Kalman filter for OSM FV (replaces EMA blend) ---
+OSM_KALMAN_Q  = 0.005        # process noise variance (mean-rev asset drifts ~0.07/tick)
+OSM_KALMAN_R  = 4.0          # observation noise variance (microprice σ≈2 from microstructure)
+OSM_KALMAN_P0 = 25.0         # initial error covariance (σ=5 for OSM → P₀=σ²=25)
+
+# --- v6.0: Position-aware Phase 1 taker threshold (OSM only) ---
+OSM_TAKER_ALPHA = 0.1        # inventory penalty on Phase 1 threshold
+                              # pos=+40 → buy only asks < fv-4; pos=+80 → buy only asks < fv-8
+
+# --- v6.0: Avellaneda-Stoikov dynamic spread for Phase 2 ---
+OSM_AS_GAMMA    = 2.0        # OSM gamma (tight book → book_half cap keeps δ=1 for OSM)
+PPR_AS_GAMMA    = 0.15       # PPR gamma (wide book → δ→2 when σ_tick≥10)
+AS_VOL_LOOKBACK = 10         # rolling window for micro-vol estimation (ticks)
 
 # --- INTARIAN_PEPPER_ROOT：趋势资产 ---
 # 三天数据验证：每天上涨+1000，std≈288，需 EMA 追踪趋势
@@ -45,10 +124,16 @@ MAX_HISTORY  = 20            # 最多保留的历史价格点数
 MIN_HISTORY  = 3             # 历史点数不足时退化为纯微观价格
 MAX_MM_LOT   = 15            # 单笔 MM 被动挂单上限（防止单次成交从极端到极端）
 
-# --- v5.4: 非线性指数库存偏斜参数 ---
-SKEW_K         = 2.0         # 超过阈值后的指数陡度
-SKEW_THRESHOLD = 0.75        # 指数启动阈值（仓位 >= 75% * limit，即60/80）
+# --- v5.5: 非线性指数库存偏斜参数 ---
+SKEW_K         = 2.0         # v5.8: 回滚至v5.4原始值（v5.5曾改为3.0）
+SKEW_THRESHOLD = 0.75        # v5.8: 回滚至v5.4原始值（v5.5曾改为0.60）
 ONE_SIDE_FRAC  = 0.875       # 单边报价阈值（仓位 >= 87.5% * limit，即70/80）
+
+# --- v5.5: 价格跳变过滤阈值 ---
+JUMP_THRESHOLD = 15          # microprice 与 FV 偏离超过 15 units 判定为异常跳变
+
+# --- 诊断模式（本地回测用，云端保持 False）---
+DIAG_MODE = False            # Set True locally to emit Diagnostic 2 & 4 prints; False for cloud submission
 
 # 供 backtester.py 读取（绘图时标注仓位上下限用）
 TRADING_CONFIG = {
@@ -95,7 +180,8 @@ def compute_skew(pos: int, alpha: float, limit: int,
     linear_part = alpha * abs_pos
     if abs_pos >= threshold:
         excess = abs_pos - threshold
-        raw = linear_part * math.exp(k * excess / limit)
+        exponent = min(k * excess / limit, 20.0)   # v5.5: 安全钳制，防未来大参数引发溢出
+        raw = linear_part * math.exp(exponent)
     else:
         raw = linear_part
     sign = 1 if pos > 0 else (-1 if pos < 0 else 0)
@@ -126,6 +212,44 @@ def compute_microprice(order_depth: OrderDepth) -> float | None:
     return (best_bid * q_ask + best_ask * q_bid) / total
 
 
+def kalman_update_1d(
+    x: float, P: float, z: float,
+    Q: float = OSM_KALMAN_Q,
+    R: float = OSM_KALMAN_R,
+) -> tuple[float, float]:
+    """
+    1D Kalman filter — predict + update (F=1, H=1, no control input).
+
+    State model:   x_t = x_{t-1} + w,  w ~ N(0, Q)   (slow random-walk drift)
+    Observation:   z_t = x_t + v,       v ~ N(0, R)   (noisy microprice)
+
+    Steady-state gain K ≈ 0.034 for Q=0.005, R=4.0 (7× slower than EMA α=0.24).
+    Cold-start gain K₀ ≈ P₀/(P₀+R) = 25/29 ≈ 0.86 — snaps to first obs quickly.
+    """
+    P_pred = P + Q                      # predict: uncertainty grows by Q each tick
+    K      = P_pred / (P_pred + R)      # Kalman gain
+    x_new  = x + K * (z - x)           # posterior state estimate
+    P_new  = (1.0 - K) * P_pred        # posterior covariance
+    return x_new, P_new
+
+
+def compute_micro_vol(prices: list, lookback: int = AS_VOL_LOOKBACK) -> float:
+    """
+    Rolling standard deviation of recent micro-price changes.
+
+    Used by the Avellaneda-Stoikov dynamic spread: δ = max(1, round(γ × σ)).
+    Returns 0.0 if fewer than 2 price points available.
+    """
+    if len(prices) < 2:
+        return 0.0
+    recent = prices[-lookback:] if len(prices) >= lookback else prices
+    diffs  = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
+    n      = len(diffs)
+    mean_d = sum(diffs) / n
+    var    = sum((d - mean_d) ** 2 for d in diffs) / max(n - 1, 1)
+    return math.sqrt(var)
+
+
 def aggressive_take_and_mm(
     symbol: str,
     order_depth: OrderDepth,
@@ -133,6 +257,9 @@ def aggressive_take_and_mm(
     position: int,
     limit: int,
     alpha: float,
+    microprice: float | None = None,        # v5.5: 用于价格跳变过滤；PPR 调用处不传，默认 None
+    taker_alpha: float = 0.0,               # v6.0: position-aware Phase 1 penalty (0 = disabled)
+    half_spread: int   = 1,                 # v6.0: AS dynamic half-spread from caller
 ) -> list:
     """
     核心交易逻辑：主动吃单 + 库存偏斜被动做市。
@@ -155,39 +282,57 @@ def aggressive_take_and_mm(
     sim_pos = position          # 模拟仓位，跟踪挂单后的预期净仓位
     fv_int  = round(fair_value) # 整数化公允价值，用于价格比较
 
-    # ---------- Phase 1a: 主动买入（吃低于FV的ask）----------
+    # ---------- Phase 1a: 仓位感知主动买入（v6.0）----------
+    # 当持多时，要求更大的价格优势才出手：threshold = fv_int - int(taker_alpha * max(pos, 0))
+    # taker_alpha=0（PPR默认）时 threshold=fv_int，行为与v5.8完全相同
     for ask_price in sorted(order_depth.sell_orders.keys()):
-        if ask_price >= fv_int:
-            break  # ask 已排序，到达 FV 及以上时停止
+        buy_thr = fv_int - int(taker_alpha * max(sim_pos, 0))
+        if ask_price >= buy_thr:
+            break
         available_vol = abs(order_depth.sell_orders[ask_price])
-        buy_capacity  = limit - sim_pos       # 还能买多少手
+        buy_capacity  = limit - sim_pos
         vol = min(available_vol, buy_capacity)
         if vol <= 0:
-            break  # 仓位已满，无法继续买入
+            break
         orders.append(Order(symbol, ask_price, vol))
         sim_pos += vol
 
-    # ---------- Phase 1b: 主动卖出（吃高于FV的bid）----------
+    # ---------- Phase 1b: 仓位感知主动卖出（v6.0）----------
+    # 当持空时，要求更大的价格优势才出手：threshold = fv_int + int(taker_alpha * max(-pos, 0))
     for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-        if bid_price <= fv_int:
-            break  # bid 已倒序，到达 FV 及以下时停止
+        sell_thr = fv_int + int(taker_alpha * max(-sim_pos, 0))
+        if bid_price <= sell_thr:
+            break
         available_vol = order_depth.buy_orders[bid_price]
-        sell_capacity = limit + sim_pos       # 还能卖多少手（仓位越负越少）
+        sell_capacity = limit + sim_pos
         vol = min(available_vol, sell_capacity)
         if vol <= 0:
-            break  # 仓位已到下限，无法继续卖出
+            break
         orders.append(Order(symbol, bid_price, -vol))
+        if DIAG_MODE and symbol == "INTARIAN_PEPPER_ROOT" and sim_pos <= -30:
+            print(f"[DIAG_P1] PPR p1-sell: bid={bid_price} fv={fv_int} delta={bid_price - fv_int} pos={sim_pos}")
         sim_pos -= vol
 
-    # ---------- Phase 2: 非线性指数库存偏斜被动做市（v5.4）----------
-    # 注意：单边报价压制仅作用于此处的 Maker 挂单，不影响 Phase 1 的 Taker 吃单
-    skew   = compute_skew(sim_pos, alpha, limit)   # v5.4: 指数偏斜替换线性偏斜
-    mm_bid = fv_int - 1 - skew
-    mm_ask = fv_int + 1 - skew
+    # ---------- Phase 2: AS动态点差 + 非线性库存偏斜被动做市（v6.0）----------
+    # 先取盘口（非穿越约束和AS书册上限均需要）
+    best_bid_now = max(order_depth.buy_orders.keys())  if order_depth.buy_orders  else None
+    best_ask_now = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
+
+    skew = compute_skew(sim_pos, alpha, limit)
+
+    # v6.0: book-aware AS spread — cap δ by current book half-spread
+    # OSM tight book (spread=2) → book_half=1 → δ always capped at 1 (no change)
+    # PPR wide book (spread≥4) → book_half≥2 → δ can widen to 2-3 in volatile periods
+    if best_bid_now is not None and best_ask_now is not None:
+        book_half  = max(1, (best_ask_now - best_bid_now) // 2)
+        eff_spread = min(half_spread, book_half)
+    else:
+        eff_spread = half_spread
+
+    mm_bid = fv_int - eff_spread - skew
+    mm_ask = fv_int + eff_spread - skew
 
     # ---- 关键约束：MM 报价绝不能穿越盘口，防止被 V3 引擎识别为 Taker ----
-    best_bid_now = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-    best_ask_now = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
     if best_ask_now is not None:
         mm_bid = min(mm_bid, best_ask_now - 1)
     if best_bid_now is not None:
@@ -213,6 +358,8 @@ def aggressive_take_and_mm(
     if buy_cap > 0:
         orders.append(Order(symbol, mm_bid, buy_cap))
     if sell_cap > 0:
+        if DIAG_MODE and symbol == "INTARIAN_PEPPER_ROOT" and sim_pos <= -30:
+            print(f"[DIAG_P2_POST] PPR p2-sell post: ask={mm_ask} fv={fv_int} pos={sim_pos} vol={sell_cap}")
         orders.append(Order(symbol, mm_ask, -sell_cap))
 
     return orders
@@ -248,13 +395,15 @@ class Trader:
 
         # INTARIAN_PEPPER_ROOT 历史价格列表，从旧到新排列
         ppr_history: list = memory.get("ppr_history", [])
-        # ASH_COATED_OSMIUM 历史微观价格列表（v5.4: 动态FV用）
+        # ASH_COATED_OSMIUM 历史微观价格列表（保留用于AS动态点差的micro_vol计算）
         osm_history: list = memory.get("osm_history", [])
+        # v6.0: Kalman filter state for OSM FV (replaces EMA blend)
+        osm_kf_x: float = memory.get("osm_kf_x", float(OSM_FV))   # FV posterior estimate
+        osm_kf_P: float = memory.get("osm_kf_P", OSM_KALMAN_P0)   # error covariance
 
         # ============================================================
-        # Module 2: ASH_COATED_OSMIUM — 动态FV做市（v5.4）
-        # FV = 慢EMA(alpha=0.05) * 0.8 + 微观价格 * 0.2
-        # 冷启动（历史不足3点）或盘口真空时坚守硬编码 OSM_FV=10000
+        # Module 2: ASH_COATED_OSMIUM — Kalman FV + 仓位感知 Phase 1（v6.0）
+        # FV = 1D Kalman(Q=0.005, R=4.0, P₀=25): K₀≈0.86（快速冷启动），稳态K≈0.034
         # ============================================================
         try:
             SYM_OSM = "ASH_COATED_OSMIUM"
@@ -267,22 +416,26 @@ class Trader:
                 if micro_osm is None and od_osm.buy_orders and od_osm.sell_orders:
                     micro_osm = (max(od_osm.buy_orders) + min(od_osm.sell_orders)) / 2.0
 
-                # --- 2b: 更新历史列表 ---
+                # --- 2b: 更新历史列表（保留，供AS动态点差的micro_vol使用）---
                 if micro_osm is not None:
                     osm_history.append(micro_osm)
                     if len(osm_history) > MAX_HISTORY:
                         osm_history = osm_history[-MAX_HISTORY:]
 
-                # --- 2c: 计算动态FV (Patch 2: 冷启动坚守理论均值) ---
-                if micro_osm is not None and len(osm_history) >= OSM_MIN_HISTORY:
-                    osm_slow_ema = compute_ema(osm_history, alpha=OSM_EMA_ALPHA)
-                    osm_fv = (1.0 - OSM_MICRO_WEIGHT) * osm_slow_ema + OSM_MICRO_WEIGHT * micro_osm
-                else:
-                    osm_fv = OSM_FV   # 冷启动或盘口真空：持守理论均值10000
+                # --- 2c: Kalman FV更新（替代EMA混合）---
+                if micro_osm is not None:
+                    osm_kf_x, osm_kf_P = kalman_update_1d(
+                        osm_kf_x, osm_kf_P, micro_osm, Q=OSM_KALMAN_Q, R=OSM_KALMAN_R
+                    )
+                osm_fv = osm_kf_x   # 后验FV估计（无观测时维持先验）
 
-                # --- 2d: 下单 ---
+                # --- 2d: 计算AS动态点差并下单 ---
+                osm_vol    = compute_micro_vol(osm_history, AS_VOL_LOOKBACK)
+                osm_spread = max(1, round(OSM_AS_GAMMA * osm_vol))
                 osm_orders = aggressive_take_and_mm(
-                    SYM_OSM, od_osm, osm_fv, pos_osm, OSM_LIMIT, OSM_ALPHA
+                    SYM_OSM, od_osm, osm_fv, pos_osm, OSM_LIMIT, OSM_ALPHA,
+                    taker_alpha=OSM_TAKER_ALPHA,
+                    half_spread=osm_spread,
                 )
                 if osm_orders:
                     result[SYM_OSM] = osm_orders
@@ -328,10 +481,14 @@ class Trader:
                 else:
                     dynamic_fv = None
 
-                # --- 3d: 下单 ---
+                # --- 3d: 计算AS动态点差并下单 ---
                 if dynamic_fv is not None:
+                    ppr_vol    = compute_micro_vol(ppr_history, AS_VOL_LOOKBACK)
+                    ppr_spread = max(1, round(PPR_AS_GAMMA * ppr_vol))
                     ppr_orders = aggressive_take_and_mm(
-                        SYM_PPR, od_ppr, dynamic_fv, pos_ppr, PPR_LIMIT, PPR_ALPHA
+                        SYM_PPR, od_ppr, dynamic_fv, pos_ppr, PPR_LIMIT, PPR_ALPHA,
+                        taker_alpha=0.0,
+                        half_spread=ppr_spread,
                     )
                     if ppr_orders:
                         result[SYM_PPR] = ppr_orders
@@ -369,7 +526,9 @@ class Trader:
         # 序列化状态并返回
         # ============================================================
         memory["ppr_history"] = ppr_history
-        memory["osm_history"] = osm_history   # v5.4: persist OSM micro-price history
+        memory["osm_history"] = osm_history   # retained for AS micro_vol computation
+        memory["osm_kf_x"]    = osm_kf_x      # v6.0: Kalman FV posterior estimate
+        memory["osm_kf_P"]    = osm_kf_P      # v6.0: Kalman error covariance
         trader_data = json.dumps(memory)
 
         return result, 0, trader_data

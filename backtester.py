@@ -196,8 +196,16 @@ def build_state_for_tick(tick_df: pd.DataFrame, positions: dict,
 FILL_PROB_IMPROVEMENT = 0.03  # v5.4: 0.3→0.03; aligns local PnL to cloud (~3k-5k)
 FILL_PROB_QUEUE       = 0.02  # v5.4: 0.1→0.02
 
+# ================================================================
+# Diagnostic constants (local diagnostics only; not used in cloud)
+# ================================================================
+_PPR = "INTARIAN_PEPPER_ROOT"
+_OSM = "ASH_COATED_OSMIUM"
+_SAT_THRESH = [40, 60, 70, 80]   # Position thresholds for saturation dwell-time tracking
+
 def match_orders(orders: dict, market_bids: dict, market_asks: dict,
-                 positions: dict, cash: dict) -> list[tuple]:
+                 positions: dict, cash: dict,
+                 diag_counters: dict | None = None) -> list[tuple]:
     """
     V3 随机撮合引擎: 在 V2 价格优先级基础上引入独立随机数，
     打破双边完美成交的平衡，模拟真实散户订单流。
@@ -238,10 +246,20 @@ def match_orders(orders: dict, market_bids: dict, market_asks: dict,
     for product, order_list in orders.items():
         best_bid = market_bids.get(product)
         best_ask = market_asks.get(product)
+        pos_at_start = positions.get(product, 0)   # position before ANY fills this tick (posted-intent proxy)
+
+        # Diag 2: count Phase-2 maker sell posted-intent at PPR pos ≤ -30
+        # Phase 2 sell: order.price > best_bid (clamped to >= best_bid+1 by non-crossing guard)
+        # Phase 1 sell: order.price <= best_bid (placed at existing book bid prices)
+        if diag_counters is not None and product == _PPR and pos_at_start <= -30:
+            for _o in order_list:
+                if _o.quantity < 0 and best_bid is not None and _o.price > best_bid:
+                    diag_counters["p2_ppr_posted_below_30"] += abs(_o.quantity)
 
         for order in order_list:
             fill_qty = 0
             fill_price = order.price
+            pos_before = positions.get(product, 0)   # position before this fill (for diagnostics)
 
             if order.quantity > 0:
                 # ---- 买单判定 ----
@@ -279,6 +297,17 @@ def match_orders(orders: dict, market_bids: dict, market_asks: dict,
                 positions[product] += fill_qty
                 cash[product] -= fill_price * fill_qty
                 fills.append((product, fill_price, fill_qty))
+
+                # Diagnostic 2: PPR sell fill attribution (Phase 1 taker vs Phase 2 maker)
+                # Taker sell: fill_price == best_bid (matching engine sets fill_price = best_bid for takers)
+                # Non-taker sell: fill_price == order.price > best_bid (improvement or queue match)
+                if diag_counters is not None and product == _PPR and fill_qty < 0:
+                    diag_counters["ppr_total_sell_fill"] += abs(fill_qty)
+                    if pos_before <= -30:
+                        if fill_price == best_bid:   # Phase 1 taker
+                            diag_counters["p1_ppr_fill_below_30"] += abs(fill_qty)
+                        else:                         # Phase 2 maker (improvement or queue)
+                            diag_counters["p2_ppr_fill_below_30"] += abs(fill_qty)
 
     return fills
 
@@ -370,6 +399,46 @@ def plot_results(results: list[dict], positions_history: list[dict],
 # Part 6: 主程序入口
 # ================================================================
 
+def _print_day_diagnostics(day, cash, positions, last_valid_mid,
+                           diag_counters, dwell_ppr_neg, dwell_ppr_pos,
+                           dwell_osm_neg, dwell_osm_pos):
+    """Print all diagnostic summaries for a completed day."""
+    # Diagnostic 1: per-asset MTM PnL (cumulative up to end of this day)
+    print(f"\n[DIAG day={day}] ── Asset MTM PnL (cumulative) ──────────────────")
+    for prod in [_PPR, _OSM]:
+        mid = last_valid_mid.get(prod, 0.0)
+        asset_mtm = cash.get(prod, 0.0) + positions.get(prod, 0) * mid
+        print(f"  {prod}: MTM PnL = {asset_mtm:.2f}  (pos={positions.get(prod,0)}, mid={mid:.1f})")
+
+    # Diagnostic 2: PPR sell fill attribution below pos -30
+    total      = diag_counters["ppr_total_sell_fill"]
+    p1         = diag_counters["p1_ppr_fill_below_30"]
+    p2         = diag_counters["p2_ppr_fill_below_30"]
+    p2_posted  = diag_counters["p2_ppr_posted_below_30"]
+    below = p1 + p2
+    pct_p1 = (p1 / total * 100) if total > 0 else 0.0
+    pct_p2 = (p2 / total * 100) if total > 0 else 0.0
+    print(f"[DIAG day={day}] ── PPR sell fill attribution ──────────────────────")
+    print(f"  PPR total sell fill vol:                {total}")
+    print(f"  Phase-1 taker  filled below pos -30:   {p1:4d}  ({pct_p1:.1f}% of total)")
+    print(f"  Phase-2 maker  posted below pos -30:   {p2_posted:4d}  (intent; fill-model independent)")
+    print(f"  Phase-2 maker  filled below pos -30:   {p2:4d}  ({pct_p2:.1f}% of total)")
+    if total > 0:
+        pct_below = below / total * 100
+        print(f"  → {pct_below:.1f}% of all PPR sell fills occurred while pos ≤ -30")
+
+    # Diagnostic 3: position saturation dwell time (raw counts; % vs total ticks computed externally)
+    print(f"[DIAG day={day}] ── Position saturation dwell (ticks) ─────────────")
+    for prod, neg_d, pos_d in [(_PPR, dwell_ppr_neg, dwell_ppr_pos),
+                                (_OSM, dwell_osm_neg, dwell_osm_pos)]:
+        neg_str = " | ".join(f"≤-{t}:{neg_d[t]}" for t in _SAT_THRESH)
+        pos_str = " | ".join(f"≥+{t}:{pos_d[t]}" for t in _SAT_THRESH)
+        print(f"  {prod}")
+        print(f"    short side: {neg_str}")
+        print(f"    long  side: {pos_str}")
+    print(f"[DIAG day={day}] ─────────────────────────────────────────────────\n")
+
+
 def run_backtest(filepath: str, output_dir: str = "."):
     """
     完整回测流程:
@@ -394,6 +463,24 @@ def run_backtest(filepath: str, output_dir: str = "."):
     results = []
     positions_history = []
 
+    # ---- Diagnostic state (resets each day) ----
+    def _fresh_diag():
+        return {
+            "ppr_total_sell_fill":    0,   # total PPR sell volume filled this day
+            "p1_ppr_fill_below_30":   0,   # Diag 2: Phase-1 taker fills at PPR pos ≤ -30
+            "p2_ppr_fill_below_30":   0,   # Diag 2: Phase-2 maker fills at PPR pos ≤ -30
+            "p2_ppr_posted_below_30": 0,   # Diag 2: Phase-2 maker sell POSTED at PPR pos ≤ -30 (intent)
+        }
+    def _fresh_dwell():
+        return {t: 0 for t in _SAT_THRESH}
+
+    diag_counters   = _fresh_diag()
+    dwell_ppr_neg   = _fresh_dwell()   # Diag 3: ticks PPR pos ≤ -thresh
+    dwell_ppr_pos   = _fresh_dwell()   # Diag 3: ticks PPR pos ≥ +thresh
+    dwell_osm_neg   = _fresh_dwell()   # Diag 3: ticks OSM pos ≤ -thresh
+    dwell_osm_pos   = _fresh_dwell()   # Diag 3: ticks OSM pos ≥ +thresh
+    prev_day        = None
+
     # 按 (day, timestamp) 或仅 timestamp 分组排序
     if "day" in df.columns:
         sort_keys = ["day", "timestamp"]
@@ -414,6 +501,19 @@ def run_backtest(filepath: str, output_dir: str = "."):
         ts = int(group_key[-1]) if isinstance(group_key, tuple) else int(group_key)
         tick_index += 1
 
+        # ---- Diag: detect day boundary and print previous day's diagnostics ----
+        current_day = group_key[0] if isinstance(group_key, tuple) and len(group_key) > 1 else None
+        if current_day is not None and prev_day is not None and current_day != prev_day:
+            _print_day_diagnostics(prev_day, cash, positions, last_valid_mid,
+                                   diag_counters, dwell_ppr_neg, dwell_ppr_pos,
+                                   dwell_osm_neg, dwell_osm_pos)
+            diag_counters = _fresh_diag()
+            dwell_ppr_neg = _fresh_dwell()
+            dwell_ppr_pos = _fresh_dwell()
+            dwell_osm_neg = _fresh_dwell()
+            dwell_osm_pos = _fresh_dwell()
+        prev_day = current_day
+
         # Step 1: 组装 TradingState
         state, mid_prices, market_bids, market_asks = build_state_for_tick(
             tick_df, positions, trader_data, ts
@@ -427,7 +527,7 @@ def run_backtest(filepath: str, output_dir: str = "."):
             orders = {}
 
         # Step 3: 撮合 + 算账
-        fills = match_orders(orders, market_bids, market_asks, positions, cash)
+        fills = match_orders(orders, market_bids, market_asks, positions, cash, diag_counters)
 
         # Step 4: 盯市估值 (v5.4: forward-fill missing mid prices)
         for product, mp in mid_prices.items():
@@ -446,12 +546,27 @@ def run_backtest(filepath: str, output_dir: str = "."):
         results.append({"tick": tick_index, "pnl": pnl, "fills": len(fills)})
         positions_history.append(dict(positions))
 
+        # ---- Diag 3: saturation dwell time ----
+        ppr_pos = positions.get(_PPR, 0)
+        osm_pos = positions.get(_OSM, 0)
+        for thresh in _SAT_THRESH:
+            if ppr_pos <= -thresh: dwell_ppr_neg[thresh] += 1
+            if ppr_pos >=  thresh: dwell_ppr_pos[thresh] += 1
+            if osm_pos <= -thresh: dwell_osm_neg[thresh] += 1
+            if osm_pos >=  thresh: dwell_osm_pos[thresh] += 1
+
         # 打印成交明细
         if fills:
             for product, price, qty in fills:
                 side = "BUY" if qty > 0 else "SELL"
                 print(f"  [{ts}] {side} {product} @ {price} x {abs(qty)} "
                       f"-> pos={positions[product]}")
+
+    # ---- Diag: print final day diagnostics ----
+    if prev_day is not None:
+        _print_day_diagnostics(prev_day, cash, positions, last_valid_mid,
+                               diag_counters, dwell_ppr_neg, dwell_ppr_pos,
+                               dwell_osm_neg, dwell_osm_pos)
 
     # 输出最终汇总
     total_fills = sum(1 for r in results if r.get("fills", 0) > 0)
