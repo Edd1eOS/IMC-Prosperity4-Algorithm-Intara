@@ -103,6 +103,36 @@ ONE_SIDE_FRAC  = 0.875
 
 DIAG_MODE = False
 
+# ================================================================
+# Logger — hard-cap all stdout to prevent Lambda I/O timeout.
+# All messages are buffered and emitted in one print() call at
+# the end of run().  Any message that would push total output
+# past MAX_LEN is silently dropped (never raises).
+# ================================================================
+MAX_LOG_LEN      = 3750   # bytes — conservative Lambda safe zone
+MAX_TRADER_DATA  = 3800   # bytes — traderData state string cap
+
+
+class Logger:
+    def __init__(self) -> None:
+        self._buf:  list[str] = []
+        self._used: int       = 0
+
+    def log(self, *args) -> None:
+        msg = " ".join(str(a) for a in args)
+        cost = len(msg) + 1          # +1 for the joining newline
+        if self._used + cost > MAX_LOG_LEN:
+            return                   # budget exhausted — drop silently
+        self._buf.append(msg)
+        self._used += cost
+
+    def flush(self) -> None:
+        if self._buf:
+            print("\n".join(self._buf))
+        self._buf.clear()
+        self._used = 0
+
+
 TRADING_CONFIG = {
     "ASH_COATED_OSMIUM":    {"limit": OSM_LIMIT, "alpha": OSM_ALPHA, "base_spread": 1},
     "INTARIAN_PEPPER_ROOT": {"limit": PPR_LIMIT, "alpha": PPR_ALPHA, "base_spread": 1},
@@ -346,6 +376,7 @@ def aggressive_take_and_mm(
 class Trader:
 
     def run(self, state: TradingState) -> tuple:
+        logger: Logger           = Logger()
         result: dict[str, list] = {}
 
         # ============================================================
@@ -406,7 +437,7 @@ class Trader:
                 if osm_orders:
                     result[SYM_OSM] = osm_orders
         except Exception as e:
-            print(f"OSM ERROR: {e}")
+            logger.log(f"[OSM ERR] {e}")
 
         # ============================================================
         # Module 3: INTARIAN_PEPPER_ROOT
@@ -478,10 +509,12 @@ class Trader:
                     if ppr_orders:
                         result[SYM_PPR] = ppr_orders
         except Exception as e:
-            print(f"PPR ERROR: {e}")
+            logger.log(f"[PPR ERR] {e}")
 
         # ============================================================
         # Module 4: 最终头寸钳制（安全网）
+        # 逐单截断，确保累计持仓绝对不超过 ±limit。
+        # 任何被截断的手数都通过 logger 记录（不 raise，不崩溃）。
         # ============================================================
         for sym, orders_list in result.items():
             limit = TRADING_CONFIG.get(sym, {}).get("limit", 80)
@@ -491,12 +524,16 @@ class Trader:
                 if order.quantity > 0:
                     max_buy = limit - sim
                     vol = min(order.quantity, max_buy)
+                    if vol < order.quantity:
+                        logger.log(f"[CLAMP BUY] {sym} {order.quantity}->{vol} @{order.price} pos={sim}")
                     if vol > 0:
                         clamped.append(Order(sym, order.price, vol))
                         sim += vol
                 elif order.quantity < 0:
                     max_sell = limit + sim
                     vol = min(abs(order.quantity), max_sell)
+                    if vol < abs(order.quantity):
+                        logger.log(f"[CLAMP SELL] {sym} {order.quantity}->-{vol} @{order.price} pos={sim}")
                     if vol > 0:
                         clamped.append(Order(sym, order.price, -vol))
                         sim -= vol
@@ -505,11 +542,20 @@ class Trader:
         # ============================================================
         # 序列化状态并返回
         # ============================================================
-        memory["ppr_history"]  = ppr_history
-        memory["osm_history"]  = osm_history
-        memory["osm_kf_x"]     = osm_kf_x
-        memory["osm_kf_P"]     = osm_kf_P
+        memory["ppr_history"]   = ppr_history
+        memory["osm_history"]   = osm_history
+        memory["osm_kf_x"]      = osm_kf_x
+        memory["osm_kf_P"]      = osm_kf_P
         memory["ppr_trend_cnt"] = ppr_trend_cnt   # v7.0: PPR 状态机计数器
         trader_data = json.dumps(memory)
 
+        # traderData 长度安全裁剪：防止 Lambda 状态传递超限。
+        # 优先缩减历史序列（保留最近 5 点），确保输出始终是合法 JSON。
+        if len(trader_data) > MAX_TRADER_DATA:
+            memory["ppr_history"] = memory["ppr_history"][-5:]
+            memory["osm_history"] = memory["osm_history"][-5:]
+            trader_data = json.dumps(memory)
+            logger.log(f"[STATE TRIM] traderData trimmed to {len(trader_data)} chars")
+
+        logger.flush()
         return result, 0, trader_data
