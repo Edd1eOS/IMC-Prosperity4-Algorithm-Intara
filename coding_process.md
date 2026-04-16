@@ -560,3 +560,134 @@ v5.6（Change 4）和 v5.7（Path B）均在 v5.5 参数基础上改动，云端
 - 距离 4,000 目标还差 648（-16.2%），下一步聚焦进一步压缩OSM饱和或提升PPR点差
 
 **Effective**: 2026-04-16 云端验证通过
+
+---
+
+## Entry 13 — v7.0: 五层微观结构升级（Active Unwind + Regime Switching + OBI）
+
+**Date**: 2026-04-16
+
+**Batch type**: 重大升级 — 针对 v6.0 的两个核心微观结构缺陷（OSM 库存死锁 + PPR 趋势滞后）。
+
+**动机（v6.0 后的残余缺陷）**:
+- 云端 PnL 3352 / 100K，目标 4000+（差 648，-16.2%）
+- OSM 在 |pos|≥80 时进入库存死锁：指数偏斜使挂单价格严重偏离市场，既无法吃点差也无法平仓，资金周转率降零
+- PPR 在强趋势行情中：EMA 持续滞后于市价，Phase 1b 不断触发逆势做空，迅速钉死在 -80，错失趋势 Beta 并承担摩擦成本
+
+---
+
+### 改动 1 — OSM Active Unwind (Phase 1c)
+
+**核心数学**：当 `sim_pos ≥ OSM_UNWIND_THRESH (=70)` 时：
+```
+unwind_sell = min(limit + sim_pos, OSM_UNWIND_LOT, avail_at_best_bid)
+place Order(symbol, best_bid, -unwind_sell)   # taker：100% 成交
+```
+对称地，`sim_pos ≤ -70` 时在 best_ask 买入。
+
+**代价分析**：每手损失约 1 tick（OSM 点差 ≈ 2，半点差 = 1）。死锁期间每 tick 收益 = 0，而主动减仓期间每手成交可快速释放后续收益空间。以 5 手/tick 的速度，从 +80 减至 +70 约需 2 个 tick（10 XIREC 点差成本），解锁后的 MM 收益远超此成本。
+
+**新增常量**：`OSM_UNWIND_THRESH = 70`, `OSM_UNWIND_LOT = 5`
+
+---
+
+### 改动 2 — PPR Regime Switching（状态机）
+
+**核心数学**：线性回归斜率估计（最小二乘）：
+```
+slope = Σ[(i - x̄)(pᵢ - ȳ)] / Σ[(i - x̄)²]   (过去 20 tick)
+```
+PPR 期望漂移 ≈ 0.1/tick，阈值 0.06 = 60% 的期望信号强度。
+
+**状态转移**：
+```
+slope >  0.06 → ppr_trend_cnt = max(0, cnt) + 1
+slope < -0.06 → ppr_trend_cnt = min(0, cnt) - 1
+|slope| ≤ 0.06 → ppr_trend_cnt = 0
+
+cnt ≥ +3 → TREND_UP  (skip_phase1_dir = +1: 跳过所有卖出)
+cnt ≤ -3 → TREND_DOWN (skip_phase1_dir = -1: 跳过所有买入)
+otherwise → MM 模式 (skip_phase1_dir = 0)
+```
+
+**预期效果**：TREND_UP 模式下 PPR 不再累积空仓，彻底解决趋势行情中的 -80 锁死问题。
+
+**新增常量**：`PPR_SLOPE_WINDOW=20`, `PPR_SLOPE_THRESH=0.06`, `PPR_TREND_CONFIRM=3`
+
+---
+
+### 改动 3 — PPR taker_alpha = 0.1（原为 0.0）
+
+与 OSM 完全对称的 Phase 1 仓位感知机制（v6.0 已验证有效）：
+```
+Phase 1b sell threshold = fv_int + int(0.1 × max(-sim_pos, 0))
+pos = -70 → threshold = fv + 7   (需 bid > fv+7 才触发，大幅压制深度建空)
+```
+在非趋势日（状态机未激活时）作为第一道防线。
+
+---
+
+### 改动 4 — OBI 对冲选择过滤（Phase 2 only）
+
+**核心数学**：
+```
+OBI = (Σ|V_bid_i| - Σ|V_ask_i|) / (Σ|V_bid_i| + Σ|V_ask_i|)
+OBI ∈ [-1, +1]
+```
+使用全簿深度（非仅 best bid/ask），更能反映真实买卖压力。
+
+**过滤规则（仅 Phase 2 Maker 层）**：
+```
+OBI > +0.7 → skip_p2_sell = True   (强买压：做市卖单将被逆向选择)
+OBI < -0.7 → skip_p2_buy  = True   (强卖压：做市买单将被逆向选择)
+```
+Phase 1 Taker 层不受影响（Phase 1 本身是吃单，方向选择已由 FV 决定）。
+
+---
+
+### 改动 5 — PPR Active Unwind（与 OSM 对称）
+
+`PPR_UNWIND_THRESH=70`, `PPR_UNWIND_LOT=5`。当 PPR 仓位 ≥+70 或 ≤-70 时，Phase 1c 以 taker 价格强制减仓，防止 PPR 因趋势超冲到达硬限后无法退出。
+
+---
+
+### 架构影响
+
+`aggressive_take_and_mm()` 新增参数：
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `unwind_thresh` | int \| None | None | Phase 1c 触发阈值 |
+| `unwind_lot` | int | 5 | Phase 1c 每 tick 最大手数 |
+| `skip_phase1_dir` | int | 0 | +1=跳过卖, -1=跳过买, 0=正常 |
+| `obi` | float | 0.0 | Phase 2 OBI 过滤值 |
+
+新增辅助函数：
+- `compute_obi(order_depth)` — 全簿 OBI 计算
+- `compute_slope(prices, window)` — 线性回归斜率
+
+移除：
+- `microprice` 参数（在 v6.0 已停用，本次清理）
+- `JUMP_THRESHOLD` 常量（同上）
+
+新增状态（traderData）：
+- `ppr_trend_cnt` — PPR 状态机有符号计数器（正=上升趋势，负=下降趋势）
+
+---
+
+### 校验标准（Validation Criteria）
+
+| 指标 | 失败阈值 | 说明 |
+|------|----------|------|
+| OSM ≥+80 停留时间 | > 总 tick 数 5% | 死锁未解除 |
+| PPR ≤-80 停留时间 | > 总 tick 数 5% | 趋势滞后未修复 |
+| 本地 PnL/Tick | < 4.05 (折算) | 整体效率下滑 |
+| 3日合计本地 PnL | < 48,000 | 低于 v6.0 预期基线 |
+
+**一键回滚方案**（若校验失败）：
+```
+git checkout 8167a41 -- round1_trader.py
+```
+commit `8167a41` 是 v6.0 的精确快照（云端验证：3352/100K）。
+
+**Effective**: 待本地回测 + 云端验证
