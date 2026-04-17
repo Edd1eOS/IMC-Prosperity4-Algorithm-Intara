@@ -135,25 +135,28 @@
 
 ---
 
-### 当前算法状态（v8.0 — PPR Drift 最大化 + OSM 容量升级）
+### 当前算法状态（v8.0b — OSM 双层 Maker + PPR Drift 最大化）
 
 **更新日期**：2026-04-17
 
 #### 架构概述
 
-v8.0 是 PPR 策略的根本性转变：从"中性做市 + 趋势检测"转为"已知上涨资产的仓位最大化"。OSM 保持均值回归做市，参数微调。
+v8.0b 在 v8.0 基础上为 OSM 新增双层 Maker 挂单（结构性改动），PPR 保持不变。v8.1 证实简单参数调优无效，转向结构性改动。
 
-1. **PPR 仓位最大化策略**：
+1. **PPR 仓位最大化策略**（同 v8.0，不变）：
    - FV = 0.3 x 快速EMA(alpha=0.6) + 0.7 x microprice + DRIFT_BIAS(10)
    - 永久 TREND_UP：禁止所有卖出（Phase 1b + Phase 2 sell）
    - taker_alpha=0.0：无建仓惩罚，pos=+50 时买入阈值不衰减
    - unwind_thresh=None：不减仓，持多到底
-   - 预期：从 tick ~5 开始冲刺到 +80，此后持仓收割 drift 收入
 
-2. **OSM Kalman 加速做市**：
-   - Kalman Q: 0.005 to 0.015（稳态增益 K: 0.035 to 0.061）
-   - MAX_MM_LOT: 15 to 20，UNWIND_LOT: 5 to 10
-   - 更快适应微结构变化，更快从极端仓位恢复
+2. **OSM 双层 Maker 做市**（v8.0b 新增 Layer 2）：
+   - Layer 1（不变）：FV ± eff_spread - skew，手数 = MAX_MM_LOT(20)
+   - Layer 2（新增）：FV ± (eff_spread + OSM_L2_OFFSET(4)) - skew，手数 = OSM_L2_LOT(10)
+   - L2 引入条件：layer2_offset > 0 and layer2_lot > 0
+   - L2 共享 L1 所有安全机制：非穿越钳制、one-side 阈值、OBI 过滤
+   - L2 更深在盘口，捕捉波动尖峰成交；Module 4 仓位钳制保证总订单不超限
+   - PPR 不使用 Layer 2（defaults layer2_offset=0, layer2_lot=0）
+   - Kalman/AS 参数同 v8.0：Q=0.015, AS_GAMMA=2.0, MAX_MM_LOT=20
 
 3. **安全架构不变**：Module 4 仓位钳制、指数偏斜、盘口非穿越钳制全部保留
 
@@ -185,7 +188,7 @@ dynamic_fv = 0.3 * ema + 0.7 * microprice + 10   # DRIFT_BIAS = 10
 
 | 资产 | limit | alpha | FV策略 | 备注 |
 |------|-------|-------|--------|------|
-| ASH_COATED_OSMIUM | 80 | 0.1 | Kalman(Q=0.015,R=4.0) | 均值回归做市 |
+| ASH_COATED_OSMIUM | 80 | 0.1 | Kalman(Q=0.015,R=4.0) | 均值回归做市，AS_GAMMA=2.0 |
 | INTARIAN_PEPPER_ROOT | 80 | 0.1 | 快速EMA+micro+drift_bias(10) | 仓位最大化，永久 TREND_UP |
 
 ---
@@ -275,13 +278,42 @@ dynamic_fv = 0.3 * ema + 0.7 * microprice + 10   # DRIFT_BIAS = 10
 - MAX_MM_LOT: 15 to 20, OSM_UNWIND_LOT: 5 to 10
 
 **预期**：云端 8,000-10,000 XIREC / 100K ticks（v7.0 基线 4,597，~2x）
-**表现**：待云端验证
+**表现**：云端 **9,028 XIREC / 100K ticks**（v7.0 基线 4,597，+96.3%）Submission ID 247252
+- PnL 曲线近乎完美线性（drift 收入主导）
+- Projected final scoring (10K iter): ~88,500 XIREC (best estimate), R1 target completion ~73.8%
+
+#### v8.1 -- OSM Parameter Tuning + PPR Entry Cost Reduction (2026-04-17)
+
+**构成**：
+- OSM_AS_GAMMA: 2.0 to 1.4（报价宽度 ~10→~7）
+- OSM_KALMAN_Q: 0.015 to 0.025（K: 0.061→0.079）
+- OSM_UNWIND_THRESH: 70 to 60（更早减仓）
+- OSM_TAKER_ALPHA: 0.1 to 0.05（减半仓位惩罚）
+- MAX_MM_LOT: 20 to 25（利用盘口深度）
+- PPR_DRIFT_BIAS: 10 to 7（节省 ~240 建仓成本）
+
+**预期**：云端 10,000-11,000 XIREC / 100K ticks（v8.0 基线 9,028，+10-20%）
+**表现**：云端 **8,774 XIREC**（v8.0 基线 9,028，-2.8%）—— **回滚至 v8.0**
+- AS_GAMMA 1.4 缩小报价宽度可能增加了逆向选择风险，抵消了成交率提升的收益
+
+#### v8.0b -- OSM Dual-Layer Maker (2026-04-17)
+
+**构成**：
+- 新增 OSM Layer 2 做市挂单：FV ± (eff_spread + 4) - skew，手数 = 10
+- Layer 1 完全不变：FV ± eff_spread - skew，手数 = MAX_MM_LOT(20)
+- 所有 v8.0 参数保持不变（AS_GAMMA=2.0, KALMAN_Q=0.015, MAX_MM_LOT=20 等）
+- PPR 不使用 Layer 2（layer2_offset/layer2_lot defaults to 0）
+- L2 共享 L1 安全机制：非穿越钳制、one-side 阈值、OBI 过滤、Module 4 仓位钳制
+
+**预期**：云端 9,200-9,800 XIREC / 100K ticks（v8.0 基线 9,028，+2-8%）
+**表现**：云端 **9,028 XIREC**（与 v8.0 完全一致）Submission ID 252480 —— **回滚至 v8.0**
+- Layer 2 报价在 FV ± ~12，深于典型 best bid/ask（~9992/~10008），低波动市场 0 成交
 
 ---
 
 ### 对后续优化的启示
 
-1. **PPR 的核心价值是 drift 收入，不是做市收益**。v7.0 证明 PPR 只有 16 笔交易、50/80 仓位，大量时间空转。v8.0 直接解决：sprint to +80，hold forever。
-2. **OSM Kalman 参数仍有调优空间**。Q=0.015 是 v7.0 的 3 倍，但可能仍不够。如果 90-100K PnL 仍低于 100，考虑 Q=0.025。
-3. **PPR_DRIFT_BIAS 是关键调优旋钮**。10 点 bias 覆盖半点差（~7-8），使 Phase 1a 持续触发。如果市场点差扩大，可能需要 12-15。如果点差缩小，5-8 即可。
-4. **PPR 在 10x 最终评分中的 drift bias 可能需要微调**。测试跑 1K iterations，最终 10K iterations。更长时间跨度中 drift 幅度不变（+100/tick），但市场微结构可能不同。
+1. **PPR 已达理论极限**。247252.log 证实：993/999 ticks 精确 +8.0 XIREC/tick，0 idle。后续 PPR 优化空间为 0。
+2. **OSM 是唯一杠杆，但简单参数调优无效**。v8.1 尝试缩小 AS_GAMMA/加快 Kalman/提前 unwind，结果 PnL -2.8%。更紧报价增加了逆向选择风险。
+3. **OSM 结构性改动也无效**。v8.0b 双层 Maker 挂单（L2 +4 点偏移）在低波动市场中 0 成交。OSM 1,688 可能已接近此数据集天花板。
+4. **运行间方差显著**。同一算法两次提交：9,828 vs 9,028（差 8.6%）。单次测试的 PnL 差异可能被误判为策略改进/退化。

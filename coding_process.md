@@ -788,6 +788,9 @@ FV adapts ~1.75x faster to micro-regime shifts. Target: reduce 90-100K PnL colla
 | OSM PnL | 1,683 | ~1,900-2,100 | +200-400 |
 | Total PnL | 4,597 | ~8,000-10,000 | ~2x |
 
+**Effective**: Yes -- Cloud PnL = **9,028 XIREC** (+96.3% vs v7.0's 4,597). Submission ID 247252.
+Curve nearly perfectly linear (drift-dominated). Projected final scoring (10K iter): ~88,500 XIREC (best estimate).
+
 ### Rollback Plan
 
 Revert 10 parameter/logic changes to restore exact v7.0 behavior:
@@ -801,3 +804,189 @@ remove PPR_DRIFT_BIAS from FV formula
 **Result**: Pending cloud verification
 
 **Effective**: Pending
+
+## Entry 15 — v8.1: OSM Parameter Tuning + PPR Entry Cost Reduction
+
+**Date**: 2026-04-17
+
+**Batch type**: Parameter tuning — OSM is the only optimization lever (PPR at theoretical ceiling).
+
+**Motivation (247252.log deep analysis)**:
+
+v8.0 cloud PnL = 9,028 XIREC (OSM=1,688, PPR=7,340) over 1K test iterations.
+Second cloud run (244581) = 9,828, indicating ~8.6% run-to-run variance.
+
+PPR analysis — **at theoretical maximum, no optimization needed**:
+- Position filled to +80 in 6 ticks (t=0→t=600), entry cost ~604 XIREC
+- 993/999 ticks produce exactly +8.0 XIREC/tick (80 × drift 0.1)
+- 0 idle ticks, 0 negative deltas after t=600
+- Steady-state rate: 8.0 XIREC/tick → projected 10K iter PPR = ~79,340
+
+OSM analysis — **primary bottleneck, volatile and underperforming**:
+- PnL = 1,688 (18.7% of total), rate = 1.69/tick
+- Per-10K block: 133, 201, 186, 85, 163, 248, 204, 285, 126, 56 (stdev ~70)
+- 90-100K block = 56 XIREC (worst block, large loss clustering)
+- 111/999 ticks produce >5 XIREC loss (11.1% of ticks)
+- Typical spread: 16 (62.3%), 18 (13.1%), 19 (12.8%)
+- Current AS half_spread = round(2.0 × vol) ≈ 10, too conservative for spread=16 market
+
+---
+
+### Changes in round1_trader.py
+
+#### Change 1 — OSM_AS_GAMMA: 2.0 → 1.4
+
+AS half_spread = round(1.4 × vol) ≈ 7 (was ~10).
+With market spread=16, our bid/ask goes from mid±10 to mid±7.
+Tighter quotes = higher fill probability, closer to best bid/ask.
+Risk: increased adverse selection if FV estimate lags.
+
+#### Change 2 — OSM_KALMAN_Q: 0.015 → 0.025
+
+Steady-state gain K = sqrt(0.025/4.0) ≈ 0.079 (was 0.061).
+FV tracks mid price ~30% faster. Target: reduce 90-100K block PnL collapse.
+
+#### Change 3 — OSM_UNWIND_THRESH: 70 → 60
+
+Earlier forced unwind trigger. Reduces time spent at extreme positions
+where adverse price movement has outsized PnL impact.
+
+#### Change 4 — OSM_TAKER_ALPHA: 0.1 → 0.05
+
+Phase 1 buy threshold: fv - int(0.05 × pos) instead of fv - int(0.1 × pos).
+At pos=+40: from fv-4 to fv-2. More mean-reversion trades executed.
+
+#### Change 5 — MAX_MM_LOT: 20 → 25
+
+Order book L1 depth commonly 10-28 lots. Larger MM orders capture more spread income per tick.
+
+#### Change 6 — PPR_DRIFT_BIAS: 10 → 7
+
+PPR ask - mid typically 6-8. Bias=7 still triggers Phase 1a buys every tick.
+Cost saving: ~3 points/unit × 80 units = ~240 XIREC less entry cost.
+
+---
+
+### What was NOT changed
+
+- All PPR structural logic (TREND_UP, no unwind, taker_alpha=0.0) — untouched, at theoretical max
+- EMA_ALPHA, MICRO_WEIGHT — PPR FV formula unchanged except bias
+- OSM_KALMAN_R, OSM_KALMAN_P0 — unchanged
+- OSM_UNWIND_LOT (=10) — unchanged
+- aggressive_take_and_mm() function body — unchanged
+- Module 4 position clamp safety net — unchanged
+- DIAG_MODE = False (cloud-safe)
+
+---
+
+### Expected Performance
+
+| Metric | v8.0 (247252 actual) | v8.1 (expected) | Delta |
+|---|---|---|---|
+| OSM PnL | 1,688 | ~2,200-2,500 | +500-800 (+30-50%) |
+| PPR PnL | 7,340 | ~7,540-7,580 | +200-240 (entry cost saving) |
+| Total PnL | 9,028 | ~10,000-11,000 | +10-20% |
+
+### Rollback Plan
+
+Revert 6 parameters to restore exact v8.0 behavior:
+```
+OSM_AS_GAMMA=2.0, OSM_KALMAN_Q=0.015, OSM_UNWIND_THRESH=70,
+OSM_TAKER_ALPHA=0.1, MAX_MM_LOT=20, PPR_DRIFT_BIAS=10
+```
+
+**Result**: Cloud PnL = 8,774 XIREC (-2.8% vs v8.0's 9,028). Regression.
+
+**Effective**: No -- Rolled back to v8.0. Tighter OSM quotes (AS_GAMMA 1.4) likely increased adverse selection losses more than fill-rate gains.
+
+## Entry 16 — v8.0a: PPR Drift Bias Isolation Test (FAILED)
+
+**Date**: 2026-04-17
+
+**Batch type**: Single-variable isolation test — PPR_DRIFT_BIAS 10 to 7.
+
+**Motivation**: v8.1 changed 6 variables simultaneously, making failure unattributable. This test isolates the one theoretically-certain improvement: reducing PPR entry cost by lowering drift bias.
+
+### Changes
+
+- PPR_DRIFT_BIAS: 10 to 7 (only change)
+
+### Result
+
+Cloud PnL = 9,131 XIREC (Submission 248418/251114). PPR: 7,443 (+103 vs 7,340). OSM: 1,688 (identical).
+
+Key finding: **OSM PnL was tick-for-tick identical** across 247252 and 251114, proving these two runs used the same market data. The 244581 submission (misread as 9,828, actual unknown) used a different dataset.
+
+PPR delta breakdown: entry cost saved +143, but 5 extra build ticks lost -40 drift = net +103.
+
+**Effective**: No -- Rolled back to v8.0. +103 (+1.1%) too small to justify. bias=7 is at the critical edge (ask~mid+6-8), risks build failure on wider-spread datasets. bias=10 has 3-4 point safety margin.
+
+## Entry 17 — v8.0b: OSM Dual-Layer Maker
+
+**Date**: 2026-04-17
+
+**Batch type**: Structural change — add Layer 2 wider maker quotes for OSM only.
+
+**Motivation**:
+
+v8.1 (6 OSM parameter changes) failed: PnL -2.8%. v8.0a (PPR-only) gave +1.1%, too small.
+OSM simple parameter tuning has hit a wall. Structural change needed.
+
+Key insight from 247252: OSM typical spread = 16 (62.3%). Layer 1 quotes at FV ± ~8 (eff_spread).
+There is room for a second, wider layer at FV ± ~12 that captures volatility-spike fills
+without competing with or affecting Layer 1.
+
+---
+
+### Changes in round1_trader.py
+
+#### Change 1 — New constants OSM_L2_OFFSET=4, OSM_L2_LOT=10
+
+Layer 2 quotes at FV ± (eff_spread + 4) - skew.
+With eff_spread ≈ 8: L2 bid ≈ 9988 (L1 ≈ 9992), L2 ask ≈ 10012 (L1 ≈ 10008).
+L2 sits at the 2nd level of the order book, capturing fills only during price spikes.
+L2 lot = 10 (half of MAX_MM_LOT=20).
+
+#### Change 2 — Function signature: +layer2_offset, +layer2_lot
+
+Two new optional parameters (default 0 = disabled). Only OSM call passes nonzero values.
+PPR call unchanged (defaults to 0, Layer 2 never executes).
+
+#### Change 3 — Phase 2b logic block
+
+After Layer 1 orders, adds Layer 2 wider quotes with:
+- Same non-crossing clamp (mm_bid_L2 < best_ask, mm_ask_L2 > best_bid)
+- Same one-side threshold suppression (pos ≥ 87.5% limit → no buy/sell)
+- Same OBI + direction filtering
+- Module 4 position clamp handles total order capacity
+
+#### Change 4 — OSM call site: pass layer2_offset and layer2_lot
+
+### What was NOT changed
+
+- Layer 1 logic: completely untouched (same prices, same lot sizes)
+- All PPR logic: untouched (layer2_offset defaults to 0)
+- All parameters: no constants changed
+- Phase 1a/1b/1c: untouched
+- Module 4 safety net: untouched
+
+---
+
+### Expected Performance
+
+| Metric | v8.0 (actual) | v8.0b (expected) | Delta |
+|---|---|---|---|
+| OSM PnL | 1,688 | ~1,900-2,100 | +200-400 (L2 fills) |
+| PPR PnL | 7,340 | 7,340 | 0 (unchanged) |
+| Total PnL | 9,028 | ~9,200-9,400 | +2-4% |
+
+### Rollback Plan
+
+Remove `layer2_offset` and `layer2_lot` from OSM call (revert to defaults 0,0).
+Phase 2b block becomes dead code (safe). Or remove Phase 2b block + constants + params.
+
+**Result**: Cloud PnL = 9,028 XIREC (Submission 252480). OSM=1,688.4375, PPR=7,340. Tick-for-tick identical to v8.0 (247252). Layer 2 received 0 fills across 1,000 ticks.
+
+Root cause: L2 quotes at FV ± ~12 were deeper than the typical best bid/ask (~9992/~10008). In this low-volatility market data, price never reached L2 depth. L2 was effectively dead orders.
+
+**Effective**: No -- Rolled back to v8.0. L2 offset too wide for this market; 0 incremental fills.
