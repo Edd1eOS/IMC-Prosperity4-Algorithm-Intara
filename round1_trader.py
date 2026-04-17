@@ -1,16 +1,35 @@
 """
-round1_trader.py — IMC Prosperity 4 Round 1 策略  [v7.0]
+round1_trader.py — IMC Prosperity 4 Round 1 策略  [v8.0]
 =========================================================
 资产（Round 1 实际产品名）：
   ASH_COATED_OSMIUM    — 固定FV资产（FV≈10000，std≈5，仓位±80）
-  INTARIAN_PEPPER_ROOT — 趋势资产（每天涨+1000，EMA动态FV，仓位±80）
+  INTARIAN_PEPPER_ROOT — 趋势资产（每天涨+1000，仓位±80）
 
-v7.0 核心升级（相对 v6.0）：
-  1. OSM 主动清仓（Active Unwind）：|pos|≥70 时在 Phase 1c 以 taker 价格强制减仓
-  2. PPR 状态机（Regime Switching）：斜率连续超阈值时进入趋势跟随模式，抑制逆势做市
-  3. PPR 仓位感知 Phase 1（taker_alpha=0.1）：与 OSM 对称，防止深度空仓持续累积
-  4. OBI 对冲选择过滤（仅 Phase 2 MM 层）：极端盘口不平衡时取消逆向 Maker 挂单
+v8.0 核心升级（相对 v7.0）：
+  1. PPR Drift 最大化：FV = 快速EMA(α=0.6)×0.3 + micro×0.7 + DRIFT_BIAS(10)
+  2. PPR 永久 TREND_UP：禁止所有卖出，仓位只做多
+  3. PPR 无建仓惩罚：taker_alpha=0.0，取消买入阈值随仓位衰减
+  4. PPR 取消主动减仓：unwind_thresh=None（持多到底）
+  5. OSM Kalman 加速：Q 0.005→0.015（更快适应微结构变化）
+  6. OSM 容量提升：MAX_MM_LOT 15→20，UNWIND_LOT 5→10
 """
+# ================================================================
+# CHANGELOG v8.0（相对 v7.0）
+# 改动 1: PPR FV Drift Bias
+#   · EMA_ALPHA: 0.2→0.6（快速跟踪），MICRO_WEIGHT: 0.3→0.7（依赖当前微观价格）
+#   · 新增 PPR_DRIFT_BIAS=10：FV 系统性上偏 10 点，使 Phase 1a 买入在正常盘口持续触发
+#   · 理论依据：PPR 每 tick 漂移 +0.1，10 点 bias 的回本期约 100 tick
+# 改动 2: PPR 永久 TREND_UP
+#   · 绕过 v7.0 状态机，强制 skip_dir=1（禁止 Phase 1b 卖出 + Phase 2 卖单）
+#   · 消除 v7.0 中 t=65.7K 的 15 手逆势抛售事件（该事件损失 ~600 XIREC）
+# 改动 3: PPR_TAKER_ALPHA: 0.1→0.0
+#   · 取消仓位感知买入阈值衰减：pos=+40 时不再需要额外 4 点折扣才买入
+# 改动 4: PPR unwind_thresh: 70→None
+#   · 取消 PPR 主动减仓：pos≥+70 时不再以 taker 价格卖出，持多到底
+# 改动 5: OSM_KALMAN_Q: 0.005→0.015
+#   · Kalman 过程噪声增大 3 倍：FV 更快适应微结构变化
+# 改动 6: MAX_MM_LOT: 15→20，OSM_UNWIND_LOT: 5→10
+#   · 增大 MM 单笔手数和减仓速度，提升 OSM 资金周转率
 # ================================================================
 # CHANGELOG v7.0（相对 v6.0）
 # 改动 1: OSM Active Unwind (Phase 1c)
@@ -56,7 +75,7 @@ OSM_MICRO_WEIGHT = 0.20
 OSM_MIN_HISTORY  = 3
 
 # v6.0: Kalman filter
-OSM_KALMAN_Q  = 0.005
+OSM_KALMAN_Q  = 0.015     # v8.0: 0.005→0.015（3x faster adaptation）
 OSM_KALMAN_R  = 4.0
 OSM_KALMAN_P0 = 25.0
 
@@ -70,23 +89,26 @@ AS_VOL_LOOKBACK = 10
 
 # v7.0: OSM 主动清仓
 OSM_UNWIND_THRESH = 70   # 触发强制减仓的仓位阈值（绝对值）
-OSM_UNWIND_LOT    = 5    # 每 tick 最多强制减仓手数
+OSM_UNWIND_LOT    = 10   # v8.0: 5→10（faster position recovery）
 
 # --- INTARIAN_PEPPER_ROOT ---
 PPR_LIMIT = 80
 PPR_ALPHA = 0.1
-EMA_ALPHA    = 0.2
-MICRO_WEIGHT = 0.3
+EMA_ALPHA    = 0.6       # v8.0: 0.2→0.6（fast EMA tracking for drift asset）
+MICRO_WEIGHT = 0.7       # v8.0: 0.3→0.7（rely on current microprice）
 MAX_HISTORY  = 20
 MIN_HISTORY  = 3
-MAX_MM_LOT   = 15
+MAX_MM_LOT   = 20        # v8.0: 15→20（larger MM lot size）
 
 # v7.0: PPR 仓位感知（与 OSM 对称）
-PPR_TAKER_ALPHA = 0.1
+PPR_TAKER_ALPHA = 0.0    # v8.0: 0.1→0.0（no position penalty on PPR buys）
 
-# v7.0: PPR 主动清仓
+# v7.0: PPR 主动清仓（v8.0: disabled via None in call, constants kept for rollback）
 PPR_UNWIND_THRESH = 70
 PPR_UNWIND_LOT    = 5
+
+# v8.0: PPR drift bias (known +100/1K ticks upward drift)
+PPR_DRIFT_BIAS = 10
 
 # v7.0: PPR 状态机参数
 PPR_SLOPE_WINDOW  = 20    # 斜率估计窗口（tick 数）
@@ -461,9 +483,9 @@ class Trader:
 
                 if micro is not None and len(ppr_history) >= MIN_HISTORY:
                     ema = compute_ema(ppr_history)
-                    dynamic_fv = (1.0 - MICRO_WEIGHT) * ema + MICRO_WEIGHT * micro
+                    dynamic_fv = (1.0 - MICRO_WEIGHT) * ema + MICRO_WEIGHT * micro + PPR_DRIFT_BIAS
                 elif micro is not None:
-                    dynamic_fv = micro
+                    dynamic_fv = micro + PPR_DRIFT_BIAS
                 else:
                     dynamic_fv = None
 
@@ -483,13 +505,9 @@ class Trader:
                 else:
                     ppr_trend_cnt = 0
 
-                # 确认趋势模式（需连续 PPR_TREND_CONFIRM tick 超阈值）
-                if ppr_trend_cnt >= PPR_TREND_CONFIRM:
-                    skip_dir = 1    # TREND_UP: 跳过所有卖出操作
-                elif ppr_trend_cnt <= -PPR_TREND_CONFIRM:
-                    skip_dir = -1   # TREND_DOWN: 跳过所有买入操作
-                else:
-                    skip_dir = 0    # MM 模式（正常双边做市）
+                # v8.0: PPR is known-uptrend asset (+100/1K ticks drift)
+                # Force TREND_UP permanently — never sell PPR
+                skip_dir = 1
 
                 # v7.0: OBI 过滤
                 obi_ppr = compute_obi(od_ppr)
@@ -499,12 +517,12 @@ class Trader:
                     ppr_spread = max(1, round(PPR_AS_GAMMA * ppr_vol))
                     ppr_orders = aggressive_take_and_mm(
                         SYM_PPR, od_ppr, dynamic_fv, pos_ppr, PPR_LIMIT, PPR_ALPHA,
-                        taker_alpha=PPR_TAKER_ALPHA,    # v7.0: 0.0 → 0.1（防深度建仓）
+                        taker_alpha=PPR_TAKER_ALPHA,    # v8.0: 0.0（no position penalty）
                         half_spread=ppr_spread,
-                        unwind_thresh=PPR_UNWIND_THRESH, # v7.0: 主动减仓
+                        unwind_thresh=None,              # v8.0: no unwind（hold longs）
                         unwind_lot=PPR_UNWIND_LOT,
-                        skip_phase1_dir=skip_dir,        # v7.0: 状态机方向过滤
-                        obi=obi_ppr,                     # v7.0: OBI 过滤
+                        skip_phase1_dir=skip_dir,        # v8.0: always TREND_UP
+                        obi=obi_ppr,
                     )
                     if ppr_orders:
                         result[SYM_PPR] = ppr_orders

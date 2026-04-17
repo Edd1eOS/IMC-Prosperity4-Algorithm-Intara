@@ -691,3 +691,113 @@ git checkout 8167a41 -- round1_trader.py
 commit `8167a41` 是 v6.0 的精确快照（云端验证：3352/100K）。
 
 **Effective**: 待本地回测 + 云端验证
+
+## Entry 14 — v8.0: PPR Drift Maximization + OSM Capacity Upgrade
+
+**Date**: 2026-04-17
+
+**Batch type**: Major upgrade — PPR position-maximizing overhaul + OSM parameter tuning.
+
+**Motivation (v7.0 post-mortem from 198447.log)**:
+
+v7.0 cloud PnL = 4,597 XIREC (OSM=1,683, PPR=2,914) over 1K test iterations.
+Detailed trade log analysis revealed PPR as the dominant bottleneck:
+
+- PPR made only 16 SUBMISSION trades in 1000 iterations (14 buys, 2 sells)
+- PPR final position = +50 out of +/-80 limit (62.5% utilization)
+- PPR dead zones: 4 gaps totaling 568 iterations (56.8% of run idle)
+  - Longest dead zone: t=68.3K -> t=87.8K (195 iterations, 19.5% of run)
+- PPR counterproductive 15-unit sell at t=65.7K (sold at 12060, PPR ended at 12100, ~600 XIREC lost)
+- PPR Phase 1a buy threshold with taker_alpha=0.1 at pos=+40: `ask < fv-4`, almost never fires
+- PPR EMA(alpha=0.2) lags true price by ~5+ points, FV systematically below market
+
+OSM secondary issue:
+- OSM 90-100K delta collapsed to 35.4 (vs average ~170 per 10K block)
+- Kalman Q=0.005 too conservative, FV slow to adapt in late-game micro-regime changes
+
+Ideal PPR scenario: Hold +80 from tick ~5 to tick 1000, drift income = 80 x 0.1 x 995 = 7,960 XIREC.
+Current PPR = 2,914. Theoretical ceiling improvement: +5,046 XIREC.
+
+---
+
+### Changes in round1_trader.py
+
+#### Change 1 — PPR FV Drift Bias (fastest tracking + upward bias)
+
+| Parameter | Before (v7.0) | After (v8.0) | Behavioral meaning |
+|---|---|---|---|
+| `EMA_ALPHA` | 0.2 | **0.6** | EMA half-life: ~4.5 ticks to ~1.2 ticks. Eliminates 5+ point FV lag |
+| `MICRO_WEIGHT` | 0.3 | **0.7** | FV = 0.3 x EMA + 0.7 x micro (was 0.7 x EMA + 0.3 x micro) |
+| `PPR_DRIFT_BIAS` | N/A | **10** (NEW) | FV = formula + 10. Biases FV above market to trigger Phase 1a buys |
+
+With PPR half-spread ~7-8: `fv = microprice + 10 > best_ask = microprice + 7`.
+Phase 1a condition `ask < fv_int` now fires every tick with ask volume.
+Cost per lot: ~6-7 points above midprice. Break-even: ~60-70 ticks.
+
+#### Change 2 — PPR Permanent TREND_UP
+
+Replaced v7.0 regime switching decision block with `skip_dir = 1` (force TREND_UP permanently).
+v7.0 slope/ppr_trend_cnt computation still runs (state preserved for rollback).
+
+Eliminates: Phase 1b sells (the t=65.7K 15-unit dump) + Phase 2 MM sell orders.
+
+#### Change 3 — PPR_TAKER_ALPHA: 0.1 to 0.0
+
+v7.0: Phase 1a buy threshold = `fv - int(0.1 * max(pos, 0))`. At pos=+40: `fv - 4`.
+v8.0: buy threshold = `fv`. No position penalty. Continuous buying until position limit.
+
+#### Change 4 — PPR unwind_thresh: 70 to None
+
+v7.0: pos >= +70 triggers Phase 1c sell at best_bid to unwind. Counterproductive for trend asset!
+v8.0: `unwind_thresh=None` in PPR call. Hold longs to maximize drift income.
+Constants `PPR_UNWIND_THRESH=70`, `PPR_UNWIND_LOT=5` preserved for rollback.
+
+#### Change 5 — OSM_KALMAN_Q: 0.005 to 0.015
+
+Steady-state Kalman gain K = sqrt(Q/R) ~ sqrt(0.015/4.0) ~ 0.061 (was 0.035).
+FV adapts ~1.75x faster to micro-regime shifts. Target: reduce 90-100K PnL collapse.
+
+#### Change 6 — OSM capacity increase
+
+| Parameter | Before | After | Effect |
+|---|---|---|---|
+| `MAX_MM_LOT` | 15 | **20** | Phase 2 MM orders up to 20 lots |
+| `OSM_UNWIND_LOT` | 5 | **10** | Phase 1c unwind 10 lots/tick. +80 to +70 in 1 tick |
+
+---
+
+### What was NOT changed
+
+- `OSM_KALMAN_R`, `OSM_KALMAN_P0`, `OSM_TAKER_ALPHA` -- unchanged
+- `OSM_AS_GAMMA`, `PPR_AS_GAMMA`, `AS_VOL_LOOKBACK` -- unchanged
+- `SKEW_K`, `SKEW_THRESHOLD`, `ONE_SIDE_FRAC` -- unchanged
+- `aggressive_take_and_mm()` function body -- unchanged (all changes via parameters)
+- Module 4 position clamp safety net -- unchanged
+- DIAG_MODE = False (cloud-safe)
+
+---
+
+### Expected Performance
+
+| Metric | v7.0 (actual) | v8.0 (expected) | Delta |
+|---|---|---|---|
+| PPR position at t=10K | +6 | >+60 | Sprint to near-max |
+| PPR trade count | 16 | >30 | Continuous buying |
+| PPR sells | 2 (incl 15-lot dump) | 0 | Eliminated |
+| PPR PnL | 2,914 | ~6,000-7,500 | +3,000-4,600 |
+| OSM PnL | 1,683 | ~1,900-2,100 | +200-400 |
+| Total PnL | 4,597 | ~8,000-10,000 | ~2x |
+
+### Rollback Plan
+
+Revert 10 parameter/logic changes to restore exact v7.0 behavior:
+```
+EMA_ALPHA=0.2, MICRO_WEIGHT=0.3, MAX_MM_LOT=15, PPR_TAKER_ALPHA=0.1,
+PPR_DRIFT_BIAS -> remove, OSM_KALMAN_Q=0.005, OSM_UNWIND_LOT=5,
+skip_dir -> restore regime switching block, unwind_thresh=PPR_UNWIND_THRESH,
+remove PPR_DRIFT_BIAS from FV formula
+```
+
+**Result**: Pending cloud verification
+
+**Effective**: Pending

@@ -135,32 +135,27 @@
 
 ---
 
-### 当前算法状态（v5.4 — 动态OSM FV + 非线性偏斜 + 回测器校准）
+### 当前算法状态（v8.0 — PPR Drift 最大化 + OSM 容量升级）
 
-**更新日期**：2026-04-14
+**更新日期**：2026-04-17
 
 #### 架构概述
 
-在 v5 四模块架构基础上，完成三项关键升级：
+v8.0 是 PPR 策略的根本性转变：从"中性做市 + 趋势检测"转为"已知上涨资产的仓位最大化"。OSM 保持均值回归做市，参数微调。
 
-1. **状态序列化模块**：`traderData` JSON 同时存储 `ppr_history` 和 `osm_history`（各最多 20 个 micro-price）。`try/except` 包裹保证任何解析失败不崩溃。
+1. **PPR 仓位最大化策略**：
+   - FV = 0.3 x 快速EMA(alpha=0.6) + 0.7 x microprice + DRIFT_BIAS(10)
+   - 永久 TREND_UP：禁止所有卖出（Phase 1b + Phase 2 sell）
+   - taker_alpha=0.0：无建仓惩罚，pos=+50 时买入阈值不衰减
+   - unwind_thresh=None：不减仓，持多到底
+   - 预期：从 tick ~5 开始冲刺到 +80，此后持仓收割 drift 收入
 
-2. **ASH_COATED_OSMIUM（动态FV，v5.4 升级）**：
-   - Phase 1 激进吃单：扫描所有 ask < FV（全额买入）和 bid > FV（全额卖出），V3 引擎 100% 成交
-   - 动态 FV = `0.8 × slow_EMA(alpha=0.05) + 0.2 × microprice`；冷启动期（历史<3点）坚守 10000
-   - Phase 2 非线性偏斜做市：`compute_skew()` 指数函数，pos≥60 时急剧放大偏斜，pos≥70 时单边压制
+2. **OSM Kalman 加速做市**：
+   - Kalman Q: 0.005 to 0.015（稳态增益 K: 0.035 to 0.061）
+   - MAX_MM_LOT: 15 to 20，UNWIND_LOT: 5 to 10
+   - 更快适应微结构变化，更快从极端仓位恢复
 
-3. **INTARIAN_PEPPER_ROOT（EMA动态FV，不变）**：
-   - `compute_microprice()` = (best_bid × q_ask + best_ask × q_bid) / (q_bid + q_ask)
-   - `dynamic_fv = 0.7 × EMA(alpha=0.2) + 0.3 × micro`
-   - Phase 2 同样使用 `compute_skew()` 和单边压制
-
-4. **三个关键防护（v5.4）**：
-   - *盘口非穿越钳制*：`mm_bid ≤ best_ask - 1`，`mm_ask ≥ best_bid + 1`
-   - *MAX_MM_LOT = 15*：单笔 MM 最多 15 手
-   - *单边报价压制*：`|pos| ≥ 70`（87.5% × 80）时仅挂平仓方向；**仅 Phase 2 Maker，Phase 1 Taker 不受限**
-
-5. **双层 try/except 隔离** + **Module 4 最终头寸钳制**（绝对安全网，不可修改）
+3. **安全架构不变**：Module 4 仓位钳制、指数偏斜、盘口非穿越钳制全部保留
 
 #### 核心公式
 
@@ -173,19 +168,25 @@ threshold = 0.75 × limit = 60
 pos=40 → 4  |  pos=60 → 6  |  pos=70 → 8  |  pos=78 → 12
 ```
 
-**OSM 动态 FV**：
+**OSM 动态 FV（v6.0+: Kalman Filter）**：
 ```
-slow_ema = EMA(osm_history, alpha=0.05)    # 约19期，追踪长期漂移
-osm_fv   = 0.8 × slow_ema + 0.2 × microprice
-冷启动（len(osm_history) < 3）: osm_fv = 10000
+kalman_update_1d(x, P, z, Q=0.015, R=4.0)
+K_steady ~ sqrt(Q/R) ~ 0.061
+osm_fv = kalman_x（自适应追踪，冷启动 K0 ~ 0.86 快速收敛）
+```
+
+**PPR 动态 FV（v8.0: Drift Bias）**：
+```
+ema = EMA(ppr_history, alpha=0.6)      # 快速 EMA，半衰期 ~1.2 tick
+dynamic_fv = 0.3 * ema + 0.7 * microprice + 10   # DRIFT_BIAS = 10
 ```
 
 #### 已配置资产
 
 | 资产 | limit | alpha | FV策略 | 备注 |
 |------|-------|-------|--------|------|
-| ASH_COATED_OSMIUM | 80 | 0.1 | 慢EMA(0.05)+micro(20%) | v5.4: 动态FV，冷启动守10000 |
-| INTARIAN_PEPPER_ROOT | 80 | 0.1 | EMA(0.2)+micro(30%) | 趋势资产，不变 |
+| ASH_COATED_OSMIUM | 80 | 0.1 | Kalman(Q=0.015,R=4.0) | 均值回归做市 |
+| INTARIAN_PEPPER_ROOT | 80 | 0.1 | 快速EMA+micro+drift_bias(10) | 仓位最大化，永久 TREND_UP |
 
 ---
 
@@ -240,14 +241,47 @@ osm_fv   = 0.8 × slow_ema + 0.2 × microprice
 | **3日合计** | | **+40,212.00** | — | — |
 
 关键观察：
-- OSM 末仓不再钉在 ±80，说明动态 FV + 指数偏斜有效驱动库存回归
+- OSM 末仓不再钉在 +/-80，说明动态 FV + 指数偏斜有效驱动库存回归
 - 本地/云端比率约 5x（13k/2.5k），剩余差距来自云端对手盘逆向选择和延迟
+
+#### v6.0 -- Kalman FV + Position-Aware Phase 1 + AS Dynamic Spread (2026-04-15)
+
+**构成**：
+- OSM FV: EMA混合 to 1D Kalman(Q=0.005, R=4.0, P0=25)
+- Phase 1 仓位感知阈值：OSM_TAKER_ALPHA=0.1
+- Phase 2 AS 动态点差：OSM_AS_GAMMA=2.0, PPR_AS_GAMMA=0.15
+
+**表现**：云端 **3,352 XIREC / 100K ticks**（v5.8 基线 2,441，+37.3%）
+
+#### v7.0 -- Active Unwind + Regime Switching + OBI (2026-04-16)
+
+**构成**：
+- OSM/PPR Active Unwind: |pos|>=70 时 Phase 1c 强制减仓 5 手/tick
+- PPR Regime Switching: 20-tick 线性回归斜率 + 3-tick 确认
+- PPR_TAKER_ALPHA=0.1（与 OSM 对称）
+- OBI 对冲选择过滤（Phase 2 only）
+
+**表现**：云端 **4,597 XIREC / 100K ticks**（v6.0 基线 3,352，+37.1%）
+- OSM=1,683, PPR=2,914
+- PPR bottleneck: 16 trades, 50/80 position, 57% idle time
+
+#### v8.0 -- PPR Drift Maximization + OSM Capacity Upgrade (2026-04-17)
+
+**构成**：
+- PPR FV = 0.3 x EMA(alpha=0.6) + 0.7 x micro + DRIFT_BIAS(10)
+- PPR permanent TREND_UP (skip_dir=1, no sells ever)
+- PPR_TAKER_ALPHA=0.0, unwind_thresh=None
+- OSM_KALMAN_Q: 0.005 to 0.015
+- MAX_MM_LOT: 15 to 20, OSM_UNWIND_LOT: 5 to 10
+
+**预期**：云端 8,000-10,000 XIREC / 100K ticks（v7.0 基线 4,597，~2x）
+**表现**：待云端验证
 
 ---
 
 ### 对后续优化的启示
 
-1. **MAX_MM_LOT 是防止仓位震荡的关键参数**。当前 15 手是经验值，可在更多数据上调优（10-25 手范围）。
-2. **EMA 追踪趋势的延迟问题**。INTARIAN_PEPPER_ROOT 每 tick 涨约 0.1，EMA(alpha=0.2) 延迟约 4 tick（0.4 单位）。延迟可接受，但如果趋势加速需要增大 alpha。
-3. **ASH_COATED_OSMIUM 的激进吃单机会**。FV=10000 硬编码正确，当 ask < 10000 时抢单机会每日均有出现。
-4. **PEPPER_ROOT 趋势方向性**。当前策略是中性 MM，未利用"每天必涨+1000"的确定性趋势。后续可考虑在 PPR 上偏多（持仓偏正方向）。
+1. **PPR 的核心价值是 drift 收入，不是做市收益**。v7.0 证明 PPR 只有 16 笔交易、50/80 仓位，大量时间空转。v8.0 直接解决：sprint to +80，hold forever。
+2. **OSM Kalman 参数仍有调优空间**。Q=0.015 是 v7.0 的 3 倍，但可能仍不够。如果 90-100K PnL 仍低于 100，考虑 Q=0.025。
+3. **PPR_DRIFT_BIAS 是关键调优旋钮**。10 点 bias 覆盖半点差（~7-8），使 Phase 1a 持续触发。如果市场点差扩大，可能需要 12-15。如果点差缩小，5-8 即可。
+4. **PPR 在 10x 最终评分中的 drift bias 可能需要微调**。测试跑 1K iterations，最终 10K iterations。更长时间跨度中 drift 幅度不变（+100/tick），但市场微结构可能不同。
