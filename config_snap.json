@@ -1,0 +1,12 @@
+{
+  "ASH_COATED_OSMIUM": {
+    "limit": 80,
+    "alpha": 0.1,
+    "base_spread": 1
+  },
+  "INTARIAN_PEPPER_ROOT": {
+    "limit": 80,
+    "alpha": 0.1,
+    "base_spread": 1
+  }
+}
